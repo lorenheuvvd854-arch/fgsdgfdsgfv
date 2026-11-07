@@ -696,10 +696,12 @@ static void run(void) {
     //      while the per-slice data region grows; span should follow data*slices ----
     io_connect_t acb = agx_open_device();
     if (acb) {
-        static const uint32_t gsl[7] = { 4, 4, 4, 4, 2, 2, 4 };
-        static const uint64_t gdt[7] = { 0x10000ULL, 0x40000ULL, 0x100000ULL, 0x400000ULL, 0x80000ULL, 0x200000ULL, 0x4000ULL };
-        static const uint64_t gpl[7] = { 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x100000ULL };
-        static const uint64_t gal[7] = { 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x100000ULL };
+        // v7: decouple the declared plane from the allocation. In every prior
+        // sweep plane == alloc, so out+0x28 could not tell them apart.
+        static const uint32_t gsl[7] = { 4, 4, 2, 4, 4, 4, 4 };
+        static const uint64_t gdt[7] = { 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL };
+        static const uint64_t gpl[7] = { 0x1000000ULL, 0x4000000ULL, 0x1000000ULL, 0x1000000ULL, 0x1000000ULL, 0x10000ULL, 0x10000ULL };
+        static const uint64_t gal[7] = { 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x400000ULL, 0x1000000ULL, 0x1000000ULL, 0x10000ULL };
         for (size_t j = 0; j < 7; j++) {
             uint64_t h = wrap_hdr(gsl[j], gdt[j], gpl[j]);
             uint32_t gsid = create_surface(conn, f1_xml3(gsl[j], gdt[j], h, gpl[j], gal[j]), "GD");
@@ -719,6 +721,15 @@ static void run(void) {
             agx_sel8(acb, 0x82, 0, gsid, 1, &gr);
             L(@"[GD%zu] span=0x%llx obj=0x%llx", j, (unsigned long long)gr.span,
               (unsigned long long)gr.obj);
+            IOSurfaceRef chk = IOSurfaceLookup(gsid);
+            if (chk) {
+                size_t ca = IOSurfaceGetAllocSize(chk);
+                L(@"[GD%zu] spanVsAlloc span=0x%llx alloc=0x%zx %s", j,
+                  (unsigned long long)gr.span, ca,
+                  gr.span > ca ? "*** OVERRUN ***" : "equal");
+                mem_probe_surface(chk, "GD", 0x4000000ULL);
+                CFRelease(chk);
+            }
         }
         IOServiceClose(acb);
     }
