@@ -270,7 +270,7 @@ static uint64_t agx_map(uint32_t sid, uint64_t *span, io_connect_t *out_ac) {
     *span = r.span;
     *out_ac = ac;
     return r.ga;
-}}
+}
 
 // Create 32 normal IOSurfaces after F1, fill them with a pattern. They reproduce
 // the allocator/VA layout of the original probe; the actual OOB target is the
