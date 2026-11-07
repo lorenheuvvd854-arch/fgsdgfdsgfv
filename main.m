@@ -47,6 +47,7 @@
 #import <sys/wait.h>
 #import <unistd.h>
 #import <errno.h>
+#import <dlfcn.h>
 #import <mach/vm_map.h>
 #import <mach/vm_region.h>
 
@@ -677,38 +678,65 @@ static void metal_cross_object_write(IOSurfaceRef surf, uint64_t agx_va, uint64_
 // starts exactly where this one ends. mach_vm_region says which of the two it
 // is, and whether the bytes past alloc belong to this surface or a neighbour.
 
+typedef kern_return_t (*vr_fn_t)(vm_map_t, vm_address_t *, vm_size_t *,
+                                 vm_region_flavor_t, vm_region_info_t,
+                                 mach_msg_type_number_t *, mach_port_t *);
+
+// vm_region_recurse is declared in the SDK header but not exported by
+// libsystem_kernel on iOS, so the region call is resolved at runtime.
+static vr_fn_t va_region_fn(const char **nameOut) {
+    static vr_fn_t fn = NULL;
+    static const char *name = NULL;
+    if (!fn) {
+        const char *cands[3] = { "vm_region_64", "vm_region", "mach_vm_region" };
+        for (int i = 0; i < 3 && !fn; i++) {
+            void *p = dlsym(RTLD_DEFAULT, cands[i]);
+            if (p) { fn = (vr_fn_t)p; name = cands[i]; }
+        }
+    }
+    if (nameOut) *nameOut = name;
+    return fn;
+}
+
 static void va_probe(IOSurfaceRef srf, const char *tag, uint64_t limit) {
     uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(srf);
     if (!base) { L(@"[VA] %s no base", tag); return; }
     uint64_t addr = (uint64_t)base;
     uint64_t alloc = (uint64_t)IOSurfaceGetAllocSize(srf);
-    L(@"[VA] %s base=0x%llx alloc=0x%llx", tag, (unsigned long long)addr,
-      (unsigned long long)alloc);
+    const char *fnName = NULL;
+    vr_fn_t fn = va_region_fn(&fnName);
+    L(@"[VA] %s base=0x%llx alloc=0x%llx fn=%s", tag, (unsigned long long)addr,
+      (unsigned long long)alloc, fnName ? fnName : "none");
+    if (!fn) { L(@"[VA] %s no region call available", tag); return; }
 
     uint64_t cur = addr;
+    uint64_t ownEnd = addr + alloc;
     uint64_t end = addr + limit;
     for (int n = 0; n < 16 && cur < end; n++) {
         vm_address_t region = (vm_address_t)cur;
         vm_size_t size = 0;
-        natural_t depth = 0;
-        vm_region_submap_info_data_64_t info;
-        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
-        kern_return_t kr = vm_region_recurse(mach_task_self(), &region, &size,
-                                             &depth,
-                                             (vm_region_recurse_info_t)&info,
-                                             &count);
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = fn(mach_task_self(), &region, &size,
+                              VM_REGION_BASIC_INFO_64,
+                              (vm_region_info_t)&info, &count, &obj);
+        if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
         if (kr != KERN_SUCCESS) {
-            L(@"[VA] %s walk stopped kr=0x%x at=0x%llx", tag, kr,
+            L(@"[VA] %s stopped kr=0x%x at=0x%llx", tag, kr,
               (unsigned long long)cur);
             break;
         }
-        L(@"[VA] %s r%d start=0x%llx size=0x%llx prot=%d/%d tag=%d",
-          tag, n, (unsigned long long)region, (unsigned long long)size,
-          info.protection, info.max_protection, info.user_tag);
+        uint64_t rEnd = (uint64_t)region + (uint64_t)size;
+        L(@"[VA] %s r%d start=0x%llx end=0x%llx size=0x%llx prot=%d/%d coversAlloc=%d",
+          tag, n, (unsigned long long)region, (unsigned long long)rEnd,
+          (unsigned long long)size, info.protection, info.max_protection,
+          rEnd >= ownEnd);
         if (size == 0) break;
-        cur = region + size;
+        cur = rEnd;
     }
-    L(@"[VA] %s walkEnd at=0x%llx", tag, (unsigned long long)cur);
+    L(@"[VA] %s walkEnd at=0x%llx ownEnd=0x%llx", tag, (unsigned long long)cur,
+      (unsigned long long)ownEnd);
 }
 
 static void va_write_test(IOSurfaceRef srf, const char *tag, uint64_t off) {
