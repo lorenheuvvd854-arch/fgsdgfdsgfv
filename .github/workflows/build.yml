@@ -12,25 +12,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Theos
+      - name: Install Theos + brew deps
         run: |
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          brew install ldid
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
       - name: Build
         run: |
           make clean
-          make ipa FINALPACKAGE=1
+          make ipa \
+            LDID="$(brew --prefix)/bin/ldid" \
+            'F1OOBPoC_LDFLAGS=-Wl,-platform_version,ios,14.0,14.0'
 
-      - name: Prepare ipa path
+      - name: Collect ipa
         run: |
           mkdir -p out
-          find . -name "*.ipa" -exec cp {} out/ \\; || true
-          ls -la out || true
+          find . -name '*.ipa' -exec cp {} out/ \\;
+          ls -la out
 
-      - name: Upload IPA
+      - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: F1OOB-PoC-ipa
           path: out/
-          if-no-files-found: true
