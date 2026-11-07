@@ -1,0 +1,36 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Build
+        run: |
+          make clean
+          make ipa FINALPACKAGE=1
+
+      - name: Prepare ipa path
+        run: |
+          mkdir -p out
+          find . -name "*.ipa" -exec cp {} out/ \\; || true
+          ls -la out || true
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: F1OOB-PoC-ipa
+          path: out/
+          if-no-files-found: true
