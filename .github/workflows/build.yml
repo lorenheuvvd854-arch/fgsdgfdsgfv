@@ -21,15 +21,13 @@ jobs:
       - name: Build
         run: |
           make clean
-          make ipa \
-            LDID="$(brew --prefix)/bin/ldid" \
-            'F1OOBPoC_LDFLAGS=-Wl,-platform_version,ios,14.0,14.0'
+          make ipa LDID="$(brew --prefix)/bin/ldid" 'F1OOBPoC_LDFLAGS=-Wl,-platform_version,ios,14.0,14.0'
 
       - name: Collect ipa
         run: |
           mkdir -p out
-          find . -name '*.ipa' -exec cp {} out/ \\;
-          ls -la out
+          cp --verbose -- F1OOB-PoC.ipa out/
+          ls -laF out
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
