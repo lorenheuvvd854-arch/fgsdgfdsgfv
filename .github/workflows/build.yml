@@ -26,7 +26,7 @@ jobs:
       - name: Collect ipa
         run: |
           mkdir -p out
-          cp --verbose -- F1OOB-PoC.ipa out/
+          cp -v F1OOB-PoC.ipa out/
           ls -laF out
 
       - name: Upload IPA artifact
