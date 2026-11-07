@@ -164,12 +164,50 @@ static uint32_t create_surface(io_connect_t conn, NSString *xml, const char *tag
 static uint64_t agx_map(uint32_t sid, uint64_t *span, io_connect_t *out_ac) {
     *span = 0;
     *out_ac = 0;
-    io_service_t agx = IOServiceGetMatchingService(kIOMasterPortDefault,
-                                                   IOServiceMatching("AGXAcceleratorG14P"));
-    if (!agx) {
-        L(@"[AGX] AGXAcceleratorG14P not found");
+// Enumerate the IOService plane and return the first AGXAccelerator* service.
+// The accelerator class name differs per SoC (e.g. AGXAcceleratorG14P on
+// T8110/A15), so a hardcoded name breaks on other devices. Log every AGX*
+// class seen so the log shows the actual name on the target.
+static io_service_t find_agx_service(void) {
+    io_registry_entry_t root = IORegistryGetRootEntry(kIOMasterPortDefault);
+    if (!root) { L(@"[AGX] no registry root"); return 0; }
+    io_iterator_t it = 0;
+    kern_return_t kr = IORegistryEntryCreateIterator(root, kIOServicePlane,
+                                                     kIORegistryIterateRecursively, &it);
+    if (kr != KERN_SUCCESS || !it) {
+        L(@"[AGX] iterator failed 0x%x", kr);
         return 0;
     }
+    io_service_t found = 0;
+    io_object_t e;
+    long n = 0;
+    while ((e = IOIteratorNext(it)) != 0) {
+        char cls[128] = {0};
+        IOObjectGetClass(e, cls);
+        if (strncmp(cls, "AGX", 3) == 0) {
+            L(@"[AGX] scan[%ld] class=%s", n, cls);
+            if (!found && strncmp(cls, "AGXAccelerator", 14) == 0) {
+                found = e;  // ownership transferred; do not release
+                continue;
+            }
+        }
+        IOObjectRelease(e);
+        n++;
+        if (n > 20000) { L(@"[AGX] scan limit hit at %ld", n); break; }
+    }
+    IOObjectRelease(it);
+    if (!found) L(@"[AGX] no AGXAccelerator service in registry");
+    return found;
+}
+
+    io_service_t agx = find_agx_service();
+    if (!agx) {
+        L(@"[AGX] no accelerator service to open");
+        return 0;
+    }
+    char cls[128] = {0};
+    IOObjectGetClass(agx, cls);
+    L(@"[AGX] opening %s", cls);
     io_connect_t ac = 0;
     kern_return_t kr = IOServiceOpen(agx, mach_task_self(), 1, &ac);
     IOObjectRelease(agx);
