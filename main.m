@@ -47,8 +47,7 @@
 #import <sys/wait.h>
 #import <unistd.h>
 #import <errno.h>
-#import <mach/mach.h>
-#import <mach/mach_vm.h>
+#import <mach/vm_map.h>
 #import <mach/vm_region.h>
 
 extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
@@ -689,15 +688,15 @@ static void va_probe(IOSurfaceRef srf, const char *tag, uint64_t limit) {
     uint64_t cur = addr;
     uint64_t end = addr + limit;
     for (int n = 0; n < 16 && cur < end; n++) {
-        mach_vm_address_t region = cur;
-        mach_vm_size_t size = 0;
+        vm_address_t region = (vm_address_t)cur;
+        vm_size_t size = 0;
         natural_t depth = 0;
         vm_region_submap_info_data_64_t info;
         mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
-        kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &region, &size,
-                                                  &depth,
-                                                  (vm_region_recurse_info_t)&info,
-                                                  &count);
+        kern_return_t kr = vm_region_recurse(mach_task_self(), &region, &size,
+                                             &depth,
+                                             (vm_region_recurse_info_t)&info,
+                                             &count);
         if (kr != KERN_SUCCESS) {
             L(@"[VA] %s walk stopped kr=0x%x at=0x%llx", tag, kr,
               (unsigned long long)cur);
