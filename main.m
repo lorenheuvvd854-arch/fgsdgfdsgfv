@@ -569,7 +569,7 @@ static void run(void) {
                 L(@"[GD%zu] s=%u d=0x%llx h=0x%llx p=0x%llx alloc=0x%zx", j, gsl[j],
                   (unsigned long long)gdt[j], (unsigned long long)h,
                   (unsigned long long)gpl[j], IOSurfaceGetAllocSize(gsrf));
-                IOSurfaceRelease(gsrf);
+                CFRelease(gsrf);
             }
             agxsel8_t gr;
             agx_sel8(acb, 0x82, 0, gsid, 1, &gr);
