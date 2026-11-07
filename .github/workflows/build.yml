@@ -40,6 +40,6 @@ jobs:
 
       - name: Publish release asset
         env:
-          GH_TOKEN: $${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create build-$$$GITHUB_RUN_NUMBER out/F1OOB-PoC.ipa --title "build $$$GITHUB_RUN_NUMBER" --notes "Automated build of $$GITHUB_SHA"
+          gh release create build-${GITHUB_RUN_NUMBER} out/F1OOB-PoC.ipa --title "build ${GITHUB_RUN_NUMBER}" --notes "Automated build of ${GITHUB_SHA}"
