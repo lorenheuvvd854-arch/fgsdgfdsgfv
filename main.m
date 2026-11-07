@@ -159,15 +159,6 @@ static uint32_t create_surface(io_connect_t conn, NSString *xml, const char *tag
     return kr == KERN_SUCCESS ? sid : 0;
 }
 
-// AGX accelerator selector 8, type 0x82: build a GPU resource from an IOSurface.
-// out+0x00 = GPU VA of the resource, out+0x28 = resource length/span.
-static uint64_t agx_map(uint32_t sid, uint64_t *span, io_connect_t *out_ac) {
-    *span = 0;
-    *out_ac = 0;
-// Enumerate the IOService plane and return the first AGXAccelerator* service.
-// The accelerator class name differs per SoC (e.g. AGXAcceleratorG14P on
-// T8110/A15), so a hardcoded name breaks on other devices. Log every AGX*
-// class seen so the log shows the actual name on the target.
 static io_service_t find_agx_service(void) {
     io_registry_entry_t root = IORegistryGetRootEntry(kIOMasterPortDefault);
     if (!root) { L(@"[AGX] no registry root"); return 0; }
@@ -200,6 +191,15 @@ static io_service_t find_agx_service(void) {
     return found;
 }
 
+// AGX accelerator selector 8, type 0x82: build a GPU resource from an IOSurface.
+// out+0x00 = GPU VA of the resource, out+0x28 = resource length/span.
+static uint64_t agx_map(uint32_t sid, uint64_t *span, io_connect_t *out_ac) {
+    *span = 0;
+    *out_ac = 0;
+// Enumerate the IOService plane and return the first AGXAccelerator* service.
+// The accelerator class name differs per SoC (e.g. AGXAcceleratorG14P on
+// T8110/A15), so a hardcoded name breaks on other devices. Log every AGX*
+// class seen so the log shows the actual name on the target.
     io_service_t agx = find_agx_service();
     if (!agx) {
         L(@"[AGX] no accelerator service to open");
