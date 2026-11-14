@@ -154,6 +154,7 @@ static void jb_stage_quicklook(void) {
         NSString *name = path.lastPathComponent;
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         g_jb_ql_calls++;
+        uint64_t t0 = mach_absolute_time();
 
         [gen generateBestRepresentationForRequest:req
                                 completionHandler:^(QLThumbnailRepresentation *rep, NSError *err) {
@@ -174,10 +175,18 @@ static void jb_stage_quicklook(void) {
             dispatch_semaphore_signal(sem);
         }];
 
-        long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 8ull * NSEC_PER_SEC));
+        // 20 s: a 318 KB shading PDF with 1024 colour operands is slow enough that
+        // 8 s could not tell "extension died" from "extension still rendering".
+        long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 20ull * NSEC_PER_SEC));
+        uint64_t t1 = mach_absolute_time();
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        uint64_t ms = (t1 - t0) * tb.numer / tb.denom / 1000000ull;
         if (waited != 0) {
             g_jb_ql_timeout++;
-            jb_logf("[JB] QL %s TIMEOUT after 8s", name.UTF8String);
+            jb_logf("[JB] QL %s TIMEOUT after 20s", name.UTF8String);
+        } else {
+            jb_logf("[JB] QL %s took %llums", name.UTF8String, (unsigned long long)ms);
         }
     }
 }

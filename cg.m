@@ -303,6 +303,7 @@ static uint8_t * volatile cg_page[CG_MAXPAGES];
 static volatile uintptr_t cg_pageaddr[CG_MAXPAGES];
 static volatile uintptr_t cg_redir_target = 0;
 static volatile int      cg_redir_decoded = 0;
+static volatile int      cg_redir_kind = -1;
 static volatile int      cg_redir_rn = -1;
 static volatile int      cg_redir_isreg = -1;
 static volatile long long cg_redir_imm = 0;
@@ -360,37 +361,52 @@ static int cg_page_is_live(uintptr_t page) {
     return (uintptr_t)region <= page;
 }
 
-// STR/STUR decoder. iOS 26 builds store with an immediate offset, iOS 27 with a
-// register plus scaled index, so both forms are handled.
-static int cg_decode_str(uint32_t insn, int *isreg, int *rn,
+// Address form of the faulting store. The base register has to be moved by a
+// different amount for each one, because the store address is not always Xn.
+//
+//   OFF   address = Xn + imm        (unsigned offset, and unscaled STUR with Xn+imm9)
+//   POST  address = Xn, then Xn += imm     (post-index: the store uses Xn untouched)
+//   PRE   address = Xn + imm, then Xn = address
+//   REG   address = Xn + (Xm << shift)
+//
+// iOS 26 emitted the immediate-offset form. iOS 27 emits post-indexed SIMD
+// stores: the faulting word on 27.0.0 / T8140 is 0xfc008661, which decodes as
+// str d1, [x19], #8 — size=11 (64-bit), V=1, bits25-24=00, opc=00, bit21=0,
+// imm9=8, bits11-10=01, Rn=19, Rt=1. Missing that form is why the first
+// redirect stage reported reg=-1.
+enum { CG_AF_OFF = 0, CG_AF_POST = 1, CG_AF_PRE = 2, CG_AF_REG = 3 };
+
+static int cg_decode_str(uint32_t insn, int *kind, int *rn,
                          long long *imm, int *rm, int *shift) {
-    if ((insn & 0x3F200000u) == 0x39000000u) {
+    // unsigned offset, general (0x39) and SIMD&FP (0x3D): size << imm12
+    if ((insn & 0x3F200000u) == 0x39000000u ||
+        (insn & 0x3F200000u) == 0x3D000000u) {
         uint32_t sz = (insn >> 30) & 3u;
-        *isreg = 0;
+        *kind = CG_AF_OFF;
         *rn = (int)((insn >> 5) & 0x1Fu);
-        *imm = (long long)(((insn >> 10) & 0xFFFu) << sz);
+        *imm = (long long)((uint64_t)((insn >> 10) & 0xFFFu) << sz);
         return 0;
     }
-    if ((insn & 0x3F200000u) == 0x3D000000u) {
-        uint32_t sz = (insn >> 30) & 3u;
-        *isreg = 0;
-        *rn = (int)((insn >> 5) & 0x1Fu);
-        *imm = (long long)(((insn >> 10) & 0xFFFu) << sz);
-        return 0;
-    }
-    if ((insn & 0x3F200C00u) == 0x38000000u) {
+    // size 111 V 00 opc 0 imm9 idx Rn Rt — unscaled, post-index, pre-index.
+    // Bit 26 (V) is masked out: both the integer and the SIMD&FP encodings land
+    // here, and 0x38000000 is the V=0 shape.
+    if ((insn & 0x3B200000u) == 0x38000000u) {
+        uint32_t idx = (insn >> 10) & 3u;
         int32_t i9 = (int32_t)((insn >> 12) & 0x1FFu);
         if (i9 & 0x100) i9 -= 0x200;
-        *isreg = 0;
         *rn = (int)((insn >> 5) & 0x1Fu);
         *imm = (long long)i9;
-        return 0;
+        if (idx == 0u) { *kind = CG_AF_OFF;  return 0; }
+        if (idx == 1u) { *kind = CG_AF_POST; return 0; }
+        if (idx == 3u) { *kind = CG_AF_PRE;  return 0; }
+        return -1;   // idx == 2 is the register form, which sets bit 21
     }
+    // register offset, SIMD&FP: size 111 1 00 opc 1 Rm option S 10 Rn Rt
     if ((insn & 0x3F000000u) == 0x3C000000u && ((insn >> 10) & 3u) == 2u) {
         uint32_t option = (insn >> 13) & 7u;
         uint32_t S = (insn >> 12) & 1u;
         if (option == 3 && S == 1) {
-            *isreg = 1;
+            *kind = CG_AF_REG;
             *rn = (int)((insn >> 5) & 0x1Fu);
             *rm = (int)((insn >> 16) & 0x1Fu);
             *shift = 3;
@@ -471,23 +487,28 @@ static void cg_fault(int sig, siginfo_t *si, void *uctx) {
 
     if (cg_mode == CGM_REDIR) {
         if (cg_redir_decoded) { cg_busy = 0; siglongjmp(cg_jb, 1); }
-        int isreg = 0, rn = -1, rm = -1, shift = 0;
+        int kind = CG_AF_OFF, rn = -1, rm = -1, shift = 0;
         long long imm = 0;
         if (!uc || !uc->uc_mcontext || pc == 0 ||
-            cg_decode_str(*(volatile uint32_t *)pc, &isreg, &rn, &imm, &rm, &shift) != 0) {
+            cg_decode_str(*(volatile uint32_t *)pc, &kind, &rn, &imm, &rm, &shift) != 0) {
             cg_busy = 0;
             siglongjmp(cg_jb, 1);
         }
         uintptr_t nb;
-        if (isreg) {
+        if (kind == CG_AF_REG) {
             uintptr_t rmv = (uintptr_t)uc->uc_mcontext->__ss.__x[rm];
             nb = cg_redir_target - (rmv << shift);
+        } else if (kind == CG_AF_POST) {
+            // The store reads Xn before the writeback, so Xn itself is the address.
+            nb = cg_redir_target;
         } else {
+            // Pre-index and every offset form: address is Xn + imm.
             nb = cg_redir_target - (uintptr_t)imm;
         }
         uc->uc_mcontext->__ss.__x[rn] = nb;
         cg_redir_decoded = 1;
-        cg_redir_isreg = isreg;
+        cg_redir_kind = kind;
+        cg_redir_isreg = (kind == CG_AF_REG) ? 1 : 0;
         cg_redir_rn = rn;
         cg_redir_imm = imm;
         cg_redir_newbase = nb;
@@ -617,10 +638,11 @@ static const cgvar g_cg_vars[CG_NVARS] = {
     { "E_rgb",   3, 1, 32, 8,  8, 136, 256, 256, 0 },
     // 16-bit coordinates with a 256-entry array
     { "F_c16",   4, 1, 16, 8,  8, 136, 256, 256, 1 },
-    // 32x longer array
-    { "G_1024",  4, 1, 32, 8,  8, 136, 256,1024, 1 },
     // 128 rows, the shape the CFData harness uses
     { "H_r128",  4, 1, 32, 8,  8, 136, 128, 128, 1 },
+    // 32x longer array. Faults on 27.0.0, so it goes last: the sweep stops here
+    // and everything above it gets measured first.
+    { "G_1024",  4, 1, 32, 8,  8, 136, 256,1024, 1 },
 };
 
 // Builder entry point for the other translation units. Returns a malloc'd PDF
@@ -804,12 +826,15 @@ void cg_section(void (*logcb)(const char *)) {
                 cg_hit = 0; cg_far = 0; cg_pc = 0; cg_insn = 0; cg_wnr = -1;
                 cg_recursive = 0;
                 cg_redir_decoded = 0; cg_redir_rn = -1; cg_redir_isreg = -1;
-                cg_redir_imm = 0; cg_redir_newbase = 0;
+                cg_redir_imm = 0; cg_redir_newbase = 0; cg_redir_kind = -1;
                 cg_mode = CGM_REDIR;
                 int done = cg_render_file(path, err, sizeof(err));
                 cg_mode = CGM_OFF;
-                cg_logf("[CGR] render=%d hits=%d decoded=%d reg=%d rn=x%d imm=0x%llx newbase=0x%llx",
-                        done, (int)cg_hit, (int)cg_redir_decoded, (int)cg_redir_isreg,
+                static const char *kname[4] = { "offset", "post", "pre", "reg" };
+                int k = (int)cg_redir_kind;
+                cg_logf("[CGR] render=%d hits=%d decoded=%d kind=%s rn=x%d imm=0x%llx newbase=0x%llx",
+                        done, (int)cg_hit, (int)cg_redir_decoded,
+                        (k >= 0 && k < 4) ? kname[k] : "none",
                         (int)cg_redir_rn, cg_redir_imm,
                         (unsigned long long)cg_redir_newbase);
                 cg_logf("[CGR] far=0x%llx insn=0x%08x wnr=%d target=0x%llx",
