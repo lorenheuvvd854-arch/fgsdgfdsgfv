@@ -8,7 +8,7 @@ include $(THEOS)/makefiles/common.mk
 APPLICATION_NAME := F1OOBPoC
 F1OOBPoC_FILES := main.m cg.m jb.m
 F1OOBPoC_RESOURCE_FILES := Info.plist
-F1OOBPoC_FRAMEWORKS := UIKit Foundation IOKit IOSurface Metal CoreGraphics CoreFoundation VideoToolbox CoreMedia CoreVideo QuickLookThumbnailing WebKit
+F1OOBPoC_FRAMEWORKS := UIKit Foundation IOKit IOSurface Metal CoreGraphics CoreFoundation VideoToolbox CoreMedia CoreVideo QuickLook QuickLookThumbnailing WebKit PDFKit
 F1OOBPoC_CFLAGS := -fobjc-arc -O2 -Wall -Wno-unused-variable -Wno-unused-function
 F1OOBPoC_LDFLAGS := -fuse-ld=/usr/bin/ld64.lld -Wl,-platform_version,ios,14.0,14.0
 F1OOBPoC_CODESIGN_FLAGS := -Sentitlements.plist

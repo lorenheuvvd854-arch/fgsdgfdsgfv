@@ -8,12 +8,17 @@
 // same geometry to every out-of-process renderer a sandboxed app can reach and
 // find out which of them takes the store.
 //
-// Three consumers, cheapest first:
+// Five consumers, cheapest first:
 //
 //   JB-1  in-process baseline      CGPDFDocument, same geometry as cg.m.
-//   JB-2  QuickLook thumbnail      com.apple.quicklook.thumbnail extension,
+//   JB-2  PDFKit draw              guarded, in this address space. Tells us
+//                                  whether the faulting store sits in the same
+//                                  renderer the preview service uses.
+//   JB-3  QuickLook thumbnail      com.apple.quicklook.thumbnail extension,
 //                                  separate process, separate sandbox.
-//   JB-3  WebKit PDF plugin        WebContent process, file:// URL.
+//   JB-4  WebKit PDF plugin        WebContent process, file:// URL.
+//   JB-5  QuickLook preview        the UI service behind Files' viewer, the one
+//                                  the CGPDFService crash logs came from.
 //
 // Everything is logged through the same callback cg.m uses. The interesting
 // output is not "it crashed" — it is which consumer returned success, which
@@ -29,7 +34,9 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
+#import <QuickLook/QuickLook.h>
 #import <QuickLookThumbnailing/QuickLookThumbnailing.h>
+#import <PDFKit/PDFKit.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +48,7 @@
 #include <sys/stat.h>
 
 extern uint8_t *cg_pdf_build(const char *name, size_t *out_len);
+extern int cg_guard_call(void (^blk)(void));
 
 static void (*g_jb_log)(const char *) = NULL;
 
@@ -68,6 +76,18 @@ static volatile int g_jb_ql_timeout = 0;
 static volatile int g_jb_wk_ok = 0;
 static volatile int g_jb_wk_fail = 0;
 static volatile int g_jb_wk_timeout = 0;
+static volatile int g_jb_pdf_ok = 0;
+static volatile int g_jb_pdf_fail = 0;
+static volatile int g_jb_pdf_fault = 0;
+static volatile int g_jb_qlp_calls = 0;
+static volatile int g_jb_qlp_done = 0;
+static volatile int g_jb_qlp_timeout = 0;
+
+static uint64_t jb_now_ms(void) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    return mach_absolute_time() * tb.numer / tb.denom / 1000000ull;
+}
 
 static NSString *jb_strerror_io(int e) {
     return [NSString stringWithUTF8String:strerror(e)];
@@ -298,7 +318,153 @@ static void jb_stage_webkit(void) {
 }
 
 // ============================================================================
-// JB-4: what the sandbox already lets us touch
+// JB-4: PDFKit in-process draw, under the unwind guard
+// ============================================================================
+
+// Not a cross-process consumer by itself, but it answers a question that shapes
+// every other stage: does PDFKit's own draw path reach the same faulting store
+// that CGPDFDocument does, and does it do so in this address space? If PDFKit
+// faults here, then the preview service that draws on our behalf is running the
+// same code with the same geometry, which is exactly what the CGPDFService
+// crash logs show.
+static void jb_stage_pdfkit(void) {
+    if (g_jb_paths.count == 0) return;
+
+    for (NSString *path in g_jb_paths) {
+        NSString *name = path.lastPathComponent;
+        __block NSString *why = nil;
+        __block int drew = 0;
+        __block double w = 0, h = 0;
+
+        uint64_t t0 = jb_now_ms();
+        int fault = cg_guard_call(^{
+            PDFDocument *doc = [[PDFDocument alloc] initWithURL:[NSURL fileURLWithPath:path]];
+            if (!doc) { why = @"document"; return; }
+            if ([doc pageCount] < 1) { why = @"pagecount"; return; }
+            PDFPage *page = [doc pageAtIndex:0];
+            if (!page) { why = @"page"; return; }
+
+            CGSize sz = [page boundsForBox:kPDFDisplayBoxMediaBox].size;
+            if (sz.width < 16 || sz.height < 16 || sz.width > 4096 || sz.height > 4096)
+                sz = CGSizeMake(1024, 1024);
+
+            UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+            fmt.scale = 1.0;
+            fmt.opaque = YES;
+            UIGraphicsImageRenderer *r =
+                [[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt];
+            UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+                [[UIColor whiteColor] setFill];
+                UIRectFill(CGRectMake(0, 0, sz.width, sz.height));
+                [page drawWithBox:kPDFDisplayBoxMediaBox toContext:ctx.CGContext];
+            }];
+            if (!img) { why = @"image"; return; }
+            drew = 1;
+            w = img.size.width;
+            h = img.size.height;
+        });
+        uint64_t ms = jb_now_ms() - t0;
+
+        if (fault) {
+            g_jb_pdf_fault++;
+            jb_logf("[PDF] %s IN-PROCESS FAULT after %llums", name.UTF8String,
+                    (unsigned long long)ms);
+        } else if (!drew) {
+            g_jb_pdf_fail++;
+            jb_logf("[PDF] %s failed (%s) after %llums", name.UTF8String,
+                    why ? why.UTF8String : "-", (unsigned long long)ms);
+        } else {
+            g_jb_pdf_ok++;
+            jb_logf("[PDF] %s drew %zux%zu in %llums", name.UTF8String,
+                    (size_t)w, (size_t)h, (unsigned long long)ms);
+        }
+    }
+}
+
+// ============================================================================
+// JB-5: QuickLook preview — the consumer that reaches CGPDFService
+// ============================================================================
+
+// The thumbnail extension survived every geometry. The preview that a person
+// opens from Files did not: both CGPDFService crash logs land inside
+// -[CGPDFPageImpl drawWithBox:size:colorSpace:options:completion:], which is the
+// service-side renderer, not the thumbnail path. So this stage presents the same
+// files through QLPreviewController, whose UI runs out of process, and reports
+// whether the presentation came back or hung.
+@interface JBQLP : NSObject <QLPreviewControllerDataSource, QLPreviewControllerDelegate>
+@property (nonatomic, strong) NSURL *url;
+@property (nonatomic, strong) dispatch_semaphore_t sem;
+@property (nonatomic, assign) int finished;
+@end
+
+@implementation JBQLP
+- (NSInteger)numberOfPreviewItemsInPreviewController:(QLPreviewController *)c {
+    (void)c;
+    return 1;
+}
+- (id<QLPreviewItem>)previewController:(QLPreviewController *)c previewItemAtIndex:(NSInteger)i {
+    (void)c; (void)i;
+    return self.url;
+}
+- (void)previewControllerDidDismiss:(QLPreviewController *)c {
+    (void)c;
+    self.finished = 1;
+    dispatch_semaphore_signal(self.sem);
+}
+@end
+
+static void jb_stage_preview(void) {
+    if (g_jb_paths.count == 0) return;
+
+    for (NSString *path in g_jb_paths) {
+        NSString *name = path.lastPathComponent;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        JBQLP *dlg = [JBQLP new];
+        dlg.url = [NSURL fileURLWithPath:path];
+        dlg.sem = sem;
+        __block QLPreviewController *vc = nil;
+
+        g_jb_qlp_calls++;
+        uint64_t t0 = jb_now_ms();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIWindow *win = jb_key_window_main();
+            UIViewController *root = win.rootViewController;
+            if (!root) { dispatch_semaphore_signal(sem); return; }
+            vc = [[QLPreviewController alloc] init];
+            vc.dataSource = dlg;
+            vc.delegate = dlg;
+            [root presentViewController:vc animated:NO completion:nil];
+        });
+
+        long waited = dispatch_semaphore_wait(sem,
+                        dispatch_time(DISPATCH_TIME_NOW, 12ull * NSEC_PER_SEC));
+        uint64_t ms = jb_now_ms() - t0;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (vc && vc.presentingViewController)
+                [vc dismissViewControllerAnimated:NO completion:nil];
+            vc.dataSource = nil;
+            vc.delegate = nil;
+        });
+
+        if (waited != 0) {
+            g_jb_qlp_timeout++;
+            jb_logf("[QLP] %s NO CALLBACK after %llums", name.UTF8String,
+                    (unsigned long long)ms);
+        } else {
+            g_jb_qlp_done++;
+            jb_logf("[QLP] %s dismissed after %llums", name.UTF8String,
+                    (unsigned long long)ms);
+        }
+        // Let the presentation teardown land before the next one goes up.
+        usleep(400000);
+    }
+    jb_logf("[QLP] calls=%d done=%d noCallback=%d",
+            g_jb_qlp_calls, g_jb_qlp_done, g_jb_qlp_timeout);
+}
+
+// ============================================================================
+// JB-6: what the sandbox already lets us touch
 // ============================================================================
 
 static void jb_sandbox_baseline(void) {
@@ -341,6 +507,10 @@ void jb_section(void (*logcb)(const char *)) {
 
     jb_baseline();
 
+    jb_logf("[JB] --- PDFKit in-process draw ---");
+    jb_stage_pdfkit();
+    jb_logf("[PDF] ok=%d fail=%d fault=%d", g_jb_pdf_ok, g_jb_pdf_fail, g_jb_pdf_fault);
+
     jb_logf("[JB] --- QuickLook thumbnail extension ---");
     jb_stage_quicklook();
     jb_logf("[JB] QL calls=%d ok=%d fail=%d timeout=%d",
@@ -350,14 +520,17 @@ void jb_section(void (*logcb)(const char *)) {
     jb_stage_webkit();
     jb_logf("[JB] WK ok=%d fail=%d timeout=%d", g_jb_wk_ok, g_jb_wk_fail, g_jb_wk_timeout);
 
+    jb_logf("[JB] --- QuickLook preview (out of process) ---");
+    jb_stage_preview();
+
     // Verdict: a consumer that returns success did not take the store, so the
     // geometry has to move for that renderer. A timeout or a terminated content
     // process is the signal we are hunting, and it lands in the analytics log
     // under the daemon's name, not ours.
-    int took = g_jb_ql_timeout + g_jb_wk_timeout + g_jb_wk_fail;
-    jb_logf("[ZB] verdict=%s qlTimeouts=%d webTerm=%d",
+    int took = g_jb_ql_timeout + g_jb_wk_timeout + g_jb_wk_fail + g_jb_qlp_timeout;
+    jb_logf("[ZB] verdict=%s qlTimeouts=%d webTerm=%d pdfFault=%d previewHang=%d",
             took > 0 ? "CONSUMER_DIED_OR_HUNG" : "ALL_CONSUMERS_SURVIVED",
-            g_jb_ql_timeout, g_jb_wk_timeout);
+            g_jb_ql_timeout, g_jb_wk_fail, g_jb_pdf_fault, g_jb_qlp_timeout);
 
     jb_logf("[JB] look in Settings > Privacy & Security > Analytics Data for");
     jb_logf("[JB]   CoreGraphics / QuickLook / WebContent entries stamped now.");

