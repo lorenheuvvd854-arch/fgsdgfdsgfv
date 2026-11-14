@@ -1142,12 +1142,17 @@ static void run(void) {
     L(@"device=%s version=%s", un.machine, un.version);
 
     cg_section(cg_log_bridge);
-    jb_section(cg_log_bridge);
-    // Last on purpose. Everything above either returns clean or faults on an
-    // unmapped page and stops there; the K ladder is the stage that can store
-    // into live heap and take the process down a second later, so all the
-    // delivery data is on disk before it runs.
+
+    // The K ladder renders PDFs through CoreGraphics, so it has to run before
+    // the consumer stages rather than after. jb_section ends with a deliberate
+    // fault inside CoreGraphics under a siglongjmp guard, and while that guard
+    // keeps the process alive it leaves CG objects in the middle of being built.
+    // A renderer that inherits that state dies in a way the handler never sees.
+    // Everything the ladder needs is already on disk, so it goes here.
     cg_tail_section(cg_log_bridge);
+
+    // Last. Out-of-process kills first, the guarded in-process fault on the way out.
+    jb_section(cg_log_bridge);
 
     io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                    IOServiceMatching("IOSurfaceRoot"));

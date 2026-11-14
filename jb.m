@@ -176,6 +176,10 @@ static void jb_stage_quicklook(void) {
         g_jb_ql_calls++;
         uint64_t t0 = mach_absolute_time();
 
+        // Written before the request goes out so a death inside the extension
+        // still names the file that caused it in our own log.
+        jb_logf("[STG] thumbnail %s request", name.UTF8String);
+
         [gen generateBestRepresentationForRequest:req
                                 completionHandler:^(QLThumbnailRepresentation *rep, NSError *err) {
             if (err) {
@@ -282,6 +286,8 @@ static void jb_stage_webkit(void) {
         __block JBNav *nav = nil;
         __block WKWebView *wv = nil;
 
+        jb_logf("[STG] webkit %s load", name.UTF8String);
+
         dispatch_async(dispatch_get_main_queue(), ^{
             nav = [JBNav new];
             nav.sem = sem;
@@ -327,56 +333,75 @@ static void jb_stage_webkit(void) {
 // faults here, then the preview service that draws on our behalf is running the
 // same code with the same geometry, which is exactly what the CGPDFService
 // crash logs show.
+// Returns 0 when the block ran to completion, 1 when it faulted.
+//
+// cg_guard_call unwinds with siglongjmp, which skips every cleanup frame between
+// the faulting store and the setjmp: autorelease-pool pops, UIKit's pushed
+// graphics context, C++ destructors, @synchronized blocks. Anything that owns a
+// stack balanced by unwinding leaves it unbalanced. So the block below does its
+// own drawing on a raw CGBitmapContext and hands the handle back through a
+// __block variable — CoreGraphics alone survives the jump, which the CG ladder
+// has already demonstrated nine times over — and the per-file autorelease pool
+// is opened outside the guard so it drains on the normal path.
 static void jb_stage_pdfkit(void) {
     if (g_jb_paths.count == 0) return;
 
     for (NSString *path in g_jb_paths) {
-        NSString *name = path.lastPathComponent;
-        __block NSString *why = nil;
-        __block int drew = 0;
-        __block double w = 0, h = 0;
+        @autoreleasepool {
+            NSString *name = path.lastPathComponent;
+            __block NSString *why = nil;
+            __block int drew = 0;
+            __block double w = 0, h = 0;
+            __block CGContextRef ctx = NULL;
 
-        uint64_t t0 = jb_now_ms();
-        int fault = cg_guard_call(^{
-            PDFDocument *doc = [[PDFDocument alloc] initWithURL:[NSURL fileURLWithPath:path]];
-            if (!doc) { why = @"document"; return; }
-            if ([doc pageCount] < 1) { why = @"pagecount"; return; }
-            PDFPage *page = [doc pageAtIndex:0];
-            if (!page) { why = @"page"; return; }
+            uint64_t t0 = jb_now_ms();
+            int fault = cg_guard_call(^{
+                PDFDocument *doc = [[PDFDocument alloc] initWithURL:
+                                    [NSURL fileURLWithPath:path]];
+                if (!doc) { why = @"document"; return; }
+                if ([doc pageCount] < 1) { why = @"pagecount"; return; }
+                PDFPage *page = [doc pageAtIndex:0];
+                if (!page) { why = @"page"; return; }
 
-            CGSize sz = [page boundsForBox:kPDFDisplayBoxMediaBox].size;
-            if (sz.width < 16 || sz.height < 16 || sz.width > 4096 || sz.height > 4096)
-                sz = CGSizeMake(1024, 1024);
+                CGSize sz = [page boundsForBox:kPDFDisplayBoxMediaBox].size;
+                if (sz.width < 16 || sz.height < 16 || sz.width > 4096 || sz.height > 4096)
+                    sz = CGSizeMake(1024, 1024);
 
-            UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
-            fmt.scale = 1.0;
-            fmt.opaque = YES;
-            UIGraphicsImageRenderer *r =
-                [[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt];
-            UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-                [[UIColor whiteColor] setFill];
-                UIRectFill(CGRectMake(0, 0, sz.width, sz.height));
-                [page drawWithBox:kPDFDisplayBoxMediaBox toContext:ctx.CGContext];
-            }];
-            if (!img) { why = @"image"; return; }
-            drew = 1;
-            w = img.size.width;
-            h = img.size.height;
-        });
-        uint64_t ms = jb_now_ms() - t0;
+                size_t bw = (size_t)sz.width, bh = (size_t)sz.height;
+                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                ctx = CGBitmapContextCreate(NULL, bw, bh, 8, 0, cs,
+                                            kCGImageAlphaPremultipliedFirst |
+                                            kCGBitmapByteOrder32Little);
+                CGColorSpaceRelease(cs);
+                if (!ctx) { why = @"ctx"; return; }
 
-        if (fault) {
-            g_jb_pdf_fault++;
-            jb_logf("[PDF] %s IN-PROCESS FAULT after %llums", name.UTF8String,
-                    (unsigned long long)ms);
-        } else if (!drew) {
-            g_jb_pdf_fail++;
-            jb_logf("[PDF] %s failed (%s) after %llums", name.UTF8String,
-                    why ? why.UTF8String : "-", (unsigned long long)ms);
-        } else {
-            g_jb_pdf_ok++;
-            jb_logf("[PDF] %s drew %zux%zu in %llums", name.UTF8String,
-                    (size_t)w, (size_t)h, (unsigned long long)ms);
+                CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
+                CGContextFillRect(ctx, CGRectMake(0, 0, (CGFloat)bw, (CGFloat)bh));
+
+                [page drawWithBox:kPDFDisplayBoxMediaBox toContext:ctx];
+                drew = 1;
+                w = (double)bw;
+                h = (double)bh;
+            });
+            uint64_t ms = jb_now_ms() - t0;
+
+            // Released outside the guard: on a fault the jump skipped nothing in
+            // CoreGraphics, so the object is still whole and still owned here.
+            if (ctx) { CGContextRelease(ctx); ctx = NULL; }
+
+            if (fault) {
+                g_jb_pdf_fault++;
+                jb_logf("[PDF] %s IN-PROCESS FAULT after %llums", name.UTF8String,
+                        (unsigned long long)ms);
+            } else if (!drew) {
+                g_jb_pdf_fail++;
+                jb_logf("[PDF] %s failed (%s) after %llums", name.UTF8String,
+                        why ? why.UTF8String : "-", (unsigned long long)ms);
+            } else {
+                g_jb_pdf_ok++;
+                jb_logf("[PDF] %s drew %zux%zu in %llums", name.UTF8String,
+                        (size_t)w, (size_t)h, (unsigned long long)ms);
+            }
         }
     }
 }
@@ -426,6 +451,7 @@ static void jb_stage_preview(void) {
 
         g_jb_qlp_calls++;
         uint64_t t0 = jb_now_ms();
+        jb_logf("[STG] preview %s present", name.UTF8String);
         dispatch_async(dispatch_get_main_queue(), ^{
             UIWindow *win = jb_key_window_main();
             UIViewController *root = win.rootViewController;
@@ -507,21 +533,31 @@ void jb_section(void (*logcb)(const char *)) {
 
     jb_baseline();
 
-    jb_logf("[JB] --- PDFKit in-process draw ---");
-    jb_stage_pdfkit();
-    jb_logf("[PDF] ok=%d fail=%d fault=%d", g_jb_pdf_ok, g_jb_pdf_fail, g_jb_pdf_fault);
-
-    jb_logf("[JB] --- QuickLook thumbnail extension ---");
+    // Order matters. Every stage that can take the process down runs before the
+    // in-process PDFKit draw, because that draw is the one that faults inside
+    // CoreGraphics on purpose: cg_guard_call catches the SIGSEGV and longjmps
+    // out, but the CG/CGPDF objects it was in the middle of building are left
+    // live and half-initialised. Anything that touches CoreGraphics afterwards
+    // inherits that state. So the guarded fault goes last, and each stage names
+    // itself on both sides so a silent death is attributable from the log alone.
+    jb_logf("[STG] >>> quicklook-thumbnail");
     jb_stage_quicklook();
-    jb_logf("[JB] QL calls=%d ok=%d fail=%d timeout=%d",
+    jb_logf("[STG] <<< quicklook-thumbnail calls=%d ok=%d fail=%d timeout=%d",
             g_jb_ql_calls, g_jb_ql_ok, g_jb_ql_fail, g_jb_ql_timeout);
 
-    jb_logf("[JB] --- WebKit content process ---");
+    jb_logf("[STG] >>> webkit");
     jb_stage_webkit();
-    jb_logf("[JB] WK ok=%d fail=%d timeout=%d", g_jb_wk_ok, g_jb_wk_fail, g_jb_wk_timeout);
+    jb_logf("[STG] <<< webkit ok=%d fail=%d timeout=%d",
+            g_jb_wk_ok, g_jb_wk_fail, g_jb_wk_timeout);
 
-    jb_logf("[JB] --- QuickLook preview (out of process) ---");
+    jb_logf("[STG] >>> quicklook-preview");
     jb_stage_preview();
+    jb_logf("[STG] <<< quicklook-preview timeout=%d", g_jb_qlp_timeout);
+
+    jb_logf("[STG] >>> pdfkit-inprocess");
+    jb_stage_pdfkit();
+    jb_logf("[STG] <<< pdfkit-inprocess ok=%d fail=%d fault=%d",
+            g_jb_pdf_ok, g_jb_pdf_fail, g_jb_pdf_fault);
 
     // Verdict: a consumer that returns success did not take the store, so the
     // geometry has to move for that renderer. A timeout or a terminated content
