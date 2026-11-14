@@ -1144,18 +1144,17 @@ static void run(void) {
 
     cg_section(cg_log_bridge);
 
-    // Consumers first, so a launch always delivers its cross-process data even
-    // if a later stage kills the process. The staging inside this call is what
-    // puts the PDFs on disk for everything after it.
-    jb_consumers(cg_log_bridge);
-
-    // The overflow ladder renders through CoreGraphics, so it runs before the
-    // in-process PDFKit draw rather than after: that draw faults inside
-    // CoreGraphics on purpose under a siglongjmp guard, and while the guard
-    // keeps the process alive it leaves CG objects half-built. A renderer that
-    // inherits that state dies in a way no handler sees. The ladder reports its
-    // own progress to disk, so losing it costs one launch and names the lane.
+    // The ladder first: it is the stage that produces new physics, it renders
+    // through CoreGraphics, and it reports its own progress to disk so losing it
+    // costs one launch and names the lane. It also has to run before the
+    // in-process PDFKit draw, which faults inside CoreGraphics on purpose and
+    // leaves CG objects half-built even though the guard keeps us alive.
     cg_tail_section(cg_log_bridge);
+
+    // Consumers after the ladder. Build-36 put them first and the thumbnail
+    // stage died before the ladder ever ran, so a whole launch produced nothing
+    // but a stage name.
+    jb_consumers(cg_log_bridge);
 
     // Last. The guarded in-process fault, on the way out.
     jb_pdfkit_stage(cg_log_bridge);

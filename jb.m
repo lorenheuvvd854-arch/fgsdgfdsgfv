@@ -158,21 +158,32 @@ static void jb_baseline(void) {
 
 static void jb_stage_quicklook(void) {
     if (g_jb_paths.count == 0) return;
-    QLThumbnailGenerator *gen = [QLThumbnailGenerator sharedGenerator];
-    if (!gen) { jb_logf("[JB] QL: no shared generator"); return; }
+
+    // Everything about QLThumbnailGenerator is main-thread API. The harness runs
+    // run() on a background queue, so the generator was being driven off-main —
+    // which is where every launch up to build-36 died, on the first request,
+    // before the extension was even reached. The request is created and started
+    // on the main queue; the wait stays here, on the background thread, so the
+    // main run loop stays free to deliver the completion.
+    __block QLThumbnailGenerator *gen = nil;
+    __block NSString *genErr = nil;
+    @try {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            gen = [QLThumbnailGenerator sharedGenerator];
+        });
+    } @catch (NSException *e) {
+        genErr = e.reason;
+    }
+    if (!gen) {
+        jb_logf("[JB] QL: no shared generator%s%s",
+                genErr ? " — " : "", genErr ? genErr.UTF8String : "");
+        return;
+    }
 
     for (NSString *path in g_jb_paths) {
-        NSURL *url = [NSURL fileURLWithPath:path];
-        QLThumbnailGenerationRequest *req =
-            [[QLThumbnailGenerationRequest alloc] initWithFileAtURL:url
-                                                               size:CGSizeMake(512, 512)
-                                                              scale:2.0
-                                                representationTypes:
-             QLThumbnailGenerationRequestRepresentationTypeAll];
-        if (!req) { jb_logf("[JB] QL: request NULL for %s", path.lastPathComponent.UTF8String); continue; }
-
         NSString *name = path.lastPathComponent;
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block int started = 0;
         g_jb_ql_calls++;
         uint64_t t0 = mach_absolute_time();
 
@@ -180,24 +191,54 @@ static void jb_stage_quicklook(void) {
         // still names the file that caused it in our own log.
         jb_logf("[STG] thumbnail %s request", name.UTF8String);
 
-        [gen generateBestRepresentationForRequest:req
-                                completionHandler:^(QLThumbnailRepresentation *rep, NSError *err) {
-            if (err) {
-                g_jb_ql_fail++;
-                jb_logf("[JB] QL %s err domain=%s code=%ld",
+        NSURL *url = [NSURL fileURLWithPath:path];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @try {
+                QLThumbnailGenerationRequest *req =
+                    [[QLThumbnailGenerationRequest alloc]
+                        initWithFileAtURL:url
+                                     size:CGSizeMake(512, 512)
+                                    scale:2.0
+                      representationTypes:
+                      QLThumbnailGenerationRequestRepresentationTypeAll];
+                if (!req) {
+                    jb_logf("[JB] QL %s request NULL", name.UTF8String);
+                    dispatch_semaphore_signal(sem);
+                    return;
+                }
+                started = 1;
+                [gen generateBestRepresentationForRequest:req
+                                        completionHandler:^(QLThumbnailRepresentation *rep,
+                                                            NSError *err) {
+                    @try {
+                        if (err) {
+                            g_jb_ql_fail++;
+                            jb_logf("[JB] QL %s err domain=%s code=%ld",
+                                    name.UTF8String,
+                                    err.domain ? err.domain.UTF8String : "?",
+                                    (long)err.code);
+                        } else {
+                            g_jb_ql_ok++;
+                            CGImageRef img = rep ? rep.CGImage : NULL;
+                            jb_logf("[JB] QL %s ok image=%s %zux%zu",
+                                    name.UTF8String, img ? "yes" : "no",
+                                    img ? CGImageGetWidth(img) : (size_t)0,
+                                    img ? CGImageGetHeight(img) : (size_t)0);
+                        }
+                    } @catch (NSException *e) {
+                        jb_logf("[JB] QL %s completion exception: %s",
+                                name.UTF8String,
+                                e.reason ? e.reason.UTF8String : e.name.UTF8String);
+                    }
+                    dispatch_semaphore_signal(sem);
+                }];
+            } @catch (NSException *e) {
+                jb_logf("[JB] QL %s request exception: %s",
                         name.UTF8String,
-                        err.domain ? err.domain.UTF8String : "?",
-                        (long)err.code);
-            } else {
-                g_jb_ql_ok++;
-                CGImageRef img = rep ? rep.CGImage : NULL;
-                jb_logf("[JB] QL %s ok image=%s %zux%zu",
-                        name.UTF8String, img ? "yes" : "no",
-                        img ? CGImageGetWidth(img) : (size_t)0,
-                        img ? CGImageGetHeight(img) : (size_t)0);
+                        e.reason ? e.reason.UTF8String : e.name.UTF8String);
+                dispatch_semaphore_signal(sem);
             }
-            dispatch_semaphore_signal(sem);
-        }];
+        });
 
         // 20 s: a 318 KB shading PDF with 1024 colour operands is slow enough that
         // 8 s could not tell "extension died" from "extension still rendering".
@@ -208,7 +249,7 @@ static void jb_stage_quicklook(void) {
         uint64_t ms = (t1 - t0) * tb.numer / tb.denom / 1000000ull;
         if (waited != 0) {
             g_jb_ql_timeout++;
-            jb_logf("[JB] QL %s TIMEOUT after 20s", name.UTF8String);
+            jb_logf("[JB] QL %s TIMEOUT after 20s (started=%d)", name.UTF8String, started);
         } else {
             jb_logf("[JB] QL %s took %llums", name.UTF8String, (unsigned long long)ms);
         }
@@ -525,6 +566,20 @@ static void jb_sandbox_baseline(void) {
 void jb_consumers(void (*logcb)(const char *));
 void jb_pdfkit_stage(void (*logcb)(const char *));
 
+// An ObjC exception in a stage is data, not a death. Without this an assertion
+// inside one consumer takes the whole launch down and the remaining stages are
+// never reached — which is exactly what hid the WebKit and preview results for
+// three builds.
+static void jb_guard_stage(const char *name, void (^blk)(void)) {
+    @try {
+        blk();
+    } @catch (NSException *e) {
+        jb_logf("[STG] %s threw %s: %s", name,
+                e.name ? e.name.UTF8String : "?",
+                e.reason ? e.reason.UTF8String : "-");
+    }
+}
+
 void jb_consumers(void (*logcb)(const char *)) {
     g_jb_log = logcb;
     jb_logf("[JB] === cross-process delivery for CVE-2026-112611 ===");
@@ -542,17 +597,17 @@ void jb_consumers(void (*logcb)(const char *)) {
     jb_baseline();
 
     jb_logf("[STG] >>> quicklook-thumbnail");
-    jb_stage_quicklook();
+    jb_guard_stage("quicklook-thumbnail", ^{ jb_stage_quicklook(); });
     jb_logf("[STG] <<< quicklook-thumbnail calls=%d ok=%d fail=%d timeout=%d",
             g_jb_ql_calls, g_jb_ql_ok, g_jb_ql_fail, g_jb_ql_timeout);
 
     jb_logf("[STG] >>> webkit");
-    jb_stage_webkit();
+    jb_guard_stage("webkit", ^{ jb_stage_webkit(); });
     jb_logf("[STG] <<< webkit ok=%d fail=%d timeout=%d",
             g_jb_wk_ok, g_jb_wk_fail, g_jb_wk_timeout);
 
     jb_logf("[STG] >>> quicklook-preview");
-    jb_stage_preview();
+    jb_guard_stage("quicklook-preview", ^{ jb_stage_preview(); });
     jb_logf("[STG] <<< quicklook-preview timeout=%d", g_jb_qlp_timeout);
 
     jb_logf("[JB] === consumers done ===");
