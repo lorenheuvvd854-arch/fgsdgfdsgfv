@@ -1130,11 +1130,18 @@ static void gd_sweep(void) {
     L(@"[SW] sweep complete");
 }
 
+extern void cg_section(void (*logcb)(const char *));
+extern void jb_section(void (*logcb)(const char *));
+static void cg_log_bridge(const char *s) { L(@"%s", s); }
+
 static void run(void) {
     struct utsname un;
     uname(&un);
     L(@"=== F1OOB-PoC start ===");
     L(@"device=%s version=%s", un.machine, un.version);
+
+    cg_section(cg_log_bridge);
+    jb_section(cg_log_bridge);
 
     io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                    IOServiceMatching("IOSurfaceRoot"));
