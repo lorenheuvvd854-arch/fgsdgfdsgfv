@@ -516,7 +516,7 @@ static int cg_render_file(const char *path, char *err, size_t errcap) {
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, 0, cs,
-                                             kCGImageAlphaPremultipliedLast);
+                                             (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
     CGColorSpaceRelease(cs);
     if (!ctx) { CGPDFDocumentRelease(doc); snprintf(err, errcap, "context"); return -1; }
 
