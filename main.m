@@ -1132,7 +1132,8 @@ static void gd_sweep(void) {
 
 extern void cg_section(void (*logcb)(const char *));
 extern void cg_tail_section(void (*logcb)(const char *));
-extern void jb_section(void (*logcb)(const char *));
+extern void jb_consumers(void (*logcb)(const char *));
+extern void jb_pdfkit_stage(void (*logcb)(const char *));
 static void cg_log_bridge(const char *s) { L(@"%s", s); }
 
 static void run(void) {
@@ -1143,16 +1144,21 @@ static void run(void) {
 
     cg_section(cg_log_bridge);
 
-    // The K ladder renders PDFs through CoreGraphics, so it has to run before
-    // the consumer stages rather than after. jb_section ends with a deliberate
-    // fault inside CoreGraphics under a siglongjmp guard, and while that guard
-    // keeps the process alive it leaves CG objects in the middle of being built.
-    // A renderer that inherits that state dies in a way the handler never sees.
-    // Everything the ladder needs is already on disk, so it goes here.
+    // Consumers first, so a launch always delivers its cross-process data even
+    // if a later stage kills the process. The staging inside this call is what
+    // puts the PDFs on disk for everything after it.
+    jb_consumers(cg_log_bridge);
+
+    // The overflow ladder renders through CoreGraphics, so it runs before the
+    // in-process PDFKit draw rather than after: that draw faults inside
+    // CoreGraphics on purpose under a siglongjmp guard, and while the guard
+    // keeps the process alive it leaves CG objects half-built. A renderer that
+    // inherits that state dies in a way no handler sees. The ladder reports its
+    // own progress to disk, so losing it costs one launch and names the lane.
     cg_tail_section(cg_log_bridge);
 
-    // Last. Out-of-process kills first, the guarded in-process fault on the way out.
-    jb_section(cg_log_bridge);
+    // Last. The guarded in-process fault, on the way out.
+    jb_pdfkit_stage(cg_log_bridge);
 
     io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                    IOServiceMatching("IOSurfaceRoot"));

