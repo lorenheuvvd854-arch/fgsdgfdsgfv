@@ -225,9 +225,14 @@ static UIWindow *jb_key_window_main(void) {
         UIWindow *cand = ((UIWindowScene *)sc).windows.firstObject;
         if (cand) return cand;
     }
+    // Legacy fallback for bundles without a scene manifest. Deprecated on iOS 13+,
+    // but it is the only path left when connectedScenes is empty.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     UIWindow *legacy = UIApplication.sharedApplication.keyWindow;
     if (legacy) return legacy;
     return UIApplication.sharedApplication.windows.firstObject;
+#pragma clang diagnostic pop
 }
 
 static UIWindow *jb_key_window(void) {
