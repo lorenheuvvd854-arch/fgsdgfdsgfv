@@ -1131,6 +1131,7 @@ static void gd_sweep(void) {
 }
 
 extern void cg_section(void (*logcb)(const char *));
+extern void cg_tail_section(void (*logcb)(const char *));
 extern void jb_section(void (*logcb)(const char *));
 static void cg_log_bridge(const char *s) { L(@"%s", s); }
 
@@ -1142,6 +1143,11 @@ static void run(void) {
 
     cg_section(cg_log_bridge);
     jb_section(cg_log_bridge);
+    // Last on purpose. Everything above either returns clean or faults on an
+    // unmapped page and stops there; the K ladder is the stage that can store
+    // into live heap and take the process down a second later, so all the
+    // delivery data is on disk before it runs.
+    cg_tail_section(cg_log_bridge);
 
     io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                    IOServiceMatching("IOSurfaceRoot"));
